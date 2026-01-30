@@ -3,11 +3,11 @@
 //!
 //! ```text
 //! 0xB000 +-----------------------+   <- top of stack (TOS)
-//!        | saved RIP             |
+//!        | saved IP              |
 //! 0xAff8 +-----------------------+
-//!        | saved RBP             |
+//!        | saved FP              |
 //! 0xAff0 +-----------------------+
-//!        | saved RSP             |
+//!        | saved SP              |
 //! 0xAfe8 +-----------------------+   <- beginning of "control context",
 //!        | args_capacity         |
 //! 0xAfe0 +-----------------------+
@@ -30,16 +30,16 @@
 //!
 //! 1.
 //! If the continuation is currently active (i.e., running directly, or ancestor
-//! of the running continuation), it stores the PC, RSP, and RBP of the *parent*
+//! of the running continuation), it stores the IP, SP, and FP of the *parent*
 //! of the running continuation.
 //!
 //! 2.
-//! If the picture shows a suspended computation, the fields store the PC, RSP,
-//! and RBP at the time of the suspension.
+//! If the picture shows a suspended computation, the fields store the IP, SP,
+//! and FP at the time of the suspension.
 //!
 //! Note that this design ensures that external tools can construct backtraces
 //! in the presence of stack switching by using frame pointers only: The
-//! wasmtime_continuation_start trampoline uses the address of the RBP field in the
+//! wasmtime_continuation_start trampoline uses the address of the FP field in the
 //! control context (0xAff0 above) as its frame pointer. This means that when
 //! passing the wasmtime_continuation_start frame while doing frame pointer walking,
 //! the parent of that frame is the last frame in the parent of this
@@ -65,6 +65,22 @@ use std::ptr;
 
 use crate::runtime::vm::stack_switching::VMHostArray;
 use crate::runtime::vm::{VMContext, VMFuncRef, ValRaw};
+
+// Control context layout.
+//
+// The control context stores the SP, FP, and saved instruction pointer (resume
+// address) for resuming a continuation. The base of the control context is at
+// TOS - CONTROL_CONTEXT_SIZE. From there, the fields are at fixed offsets:
+//
+//   base + 0x00: SP
+//   base + 0x08: FP
+//   base + 0x10: saved instruction pointer (resume address)
+//
+// This layout matches the codegen-side ControlContextLayout { sp:0, fp:8, ip:16 }.
+const CONTROL_CONTEXT_SIZE: usize = 0x18;
+const CONTROL_CONTEXT_SP_OFFSET: usize = 0x00;
+const CONTROL_CONTEXT_FP_OFFSET: usize = 0x08;
+const CONTROL_CONTEXT_IP_OFFSET: usize = 0x10;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Allocator {
@@ -158,28 +174,29 @@ impl VMContinuationStack {
     }
 
     pub fn control_context_instruction_pointer(&self) -> usize {
-        // See picture at top of this file:
-        // RIP is stored 8 bytes below top of stack.
+        // IP is stored at base + 0x10, where base = TOS - 0x18.
+        // So IP is at TOS - 0x18 + 0x10 = TOS - 0x08.
         unsafe {
-            let ptr = self.top.sub(8).cast::<usize>();
+            let base = self.top.sub(CONTROL_CONTEXT_SIZE);
+            let ptr = base.add(CONTROL_CONTEXT_IP_OFFSET).cast::<usize>();
             *ptr
         }
     }
 
     pub fn control_context_frame_pointer(&self) -> usize {
-        // See picture at top of this file:
-        // RBP is stored 16 bytes below top of stack.
+        // FP is stored at base + 0x08 = TOS - 0x10.
         unsafe {
-            let ptr = self.top.sub(16).cast::<usize>();
+            let base = self.top.sub(CONTROL_CONTEXT_SIZE);
+            let ptr = base.add(CONTROL_CONTEXT_FP_OFFSET).cast::<usize>();
             *ptr
         }
     }
 
     pub fn control_context_stack_pointer(&self) -> usize {
-        // See picture at top of this file:
-        // RSP is stored 24 bytes below top of stack.
+        // SP is stored at base + 0x00 = TOS - 0x18.
         unsafe {
-            let ptr = self.top.sub(24).cast::<usize>();
+            let base = self.top.sub(CONTROL_CONTEXT_SIZE);
+            let ptr = base.add(CONTROL_CONTEXT_SP_OFFSET).cast::<usize>();
             *ptr
         }
     }
@@ -208,9 +225,9 @@ impl VMContinuationStack {
     ///  Offset from    |
     ///       TOS       | Contents
     ///  ---------------|-------------------------------------------------------
-    ///       -0x08     | address of wasmtime_continuation_start function (future PC)
-    ///       -0x10     | TOS - 0x10 (future RBP)
-    ///       -0x18     | TOS - 0x40 - s (future RSP)
+    ///       -0x08     | address of wasmtime_continuation_start function (future IP)
+    ///       -0x10     | TOS - 0x10 (future FP)
+    ///       -0x18     | TOS - 0x40 - s (future SP)
     ///       -0x20     | args_capacity
     ///
     ///
@@ -247,6 +264,15 @@ impl VMContinuationStack {
 
             let args_data_size =
                 usize::try_from(args_capacity).unwrap() * std::mem::size_of::<ValRaw>();
+
+            // The initial SP must be 16-byte aligned.
+            let initial_sp = tos.sub(0x40 + args_data_size);
+            debug_assert_eq!(
+                initial_sp as usize % 16,
+                0,
+                "initial SP must be 16-byte aligned"
+            );
+
             let args_data_ptr = if args_capacity == 0 {
                 ptr::null_mut()
             } else {
@@ -346,5 +372,56 @@ cfg_if::cfg_if! {
         use aarch64::*;
     } else {
         compile_error!("the stack switching feature is not supported on this CPU architecture");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_control_context_layout_relationships() {
+        // The control context fields must be 8 bytes apart, in order: SP, FP, IP.
+        assert_eq!(
+            CONTROL_CONTEXT_FP_OFFSET - CONTROL_CONTEXT_SP_OFFSET,
+            8,
+            "FP must be 8 bytes after SP in control context"
+        );
+        assert_eq!(
+            CONTROL_CONTEXT_IP_OFFSET - CONTROL_CONTEXT_FP_OFFSET,
+            8,
+            "IP must be 8 bytes after FP in control context"
+        );
+
+        // The control context size must accommodate all three fields.
+        assert_eq!(
+            CONTROL_CONTEXT_SIZE,
+            CONTROL_CONTEXT_IP_OFFSET + 8,
+            "control context size must be IP offset + 8"
+        );
+    }
+
+    #[test]
+    fn test_initial_sp_alignment() {
+        // For any args_capacity, the initial SP must be 16-byte aligned.
+        // initial_sp = TOS - 0x40 - (args_capacity * sizeof(ValRaw))
+        //
+        // This requires:
+        // 1. 0x40 is 16-byte aligned (it's 64)
+        // 2. sizeof(ValRaw) is 16 bytes
+        //
+        // Then args_capacity * 16 is always a multiple of 16.
+        assert_eq!(0x40 % 16, 0, "fixed offset must be 16-byte aligned");
+        assert_eq!(
+            core::mem::size_of::<ValRaw>() % 16,
+            0,
+            "ValRaw size must be a multiple of 16"
+        );
+    }
+
+    #[test]
+    fn test_valraw_size() {
+        // ValRaw must be 16 bytes to maintain stack alignment.
+        assert_eq!(core::mem::size_of::<ValRaw>(), 16);
     }
 }

@@ -73,7 +73,7 @@ pub(crate) unsafe extern "C" fn wasmtime_continuation_start() {
         // context near TOS.
         //
         // Control context layout (relative to x29 = TOS - 0x10):
-        //   [x29 + 0x08] = parent PC (at TOS - 0x08)
+        //   [x29 + 0x08] = saved instruction pointer (at TOS - 0x08)
         //   [x29 + 0x00] = parent FP (at TOS - 0x10)
         //   [x29 - 0x08] = parent SP (at TOS - 0x18)
 
