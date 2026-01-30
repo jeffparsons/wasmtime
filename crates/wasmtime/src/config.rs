@@ -2203,7 +2203,8 @@ impl Config {
                 use target_lexicon::*;
                 match self.compiler_target() {
                     Triple {
-                        architecture: Architecture::X86_64 | Architecture::X86_64h,
+                        architecture:
+                            Architecture::X86_64 | Architecture::X86_64h | Architecture::Aarch64(_),
                         operating_system:
                             OperatingSystem::Linux
                             | OperatingSystem::MacOSX(_)
@@ -2214,7 +2215,7 @@ impl Config {
                     }
 
                     _ => {
-                        // On platforms other than x64 Unix-like, we don't
+                        // On platforms other than x64/arm64 Unix-like, we don't
                         // support stack switching.
                         unsupported |= WasmFeatures::STACK_SWITCHING;
                     }
