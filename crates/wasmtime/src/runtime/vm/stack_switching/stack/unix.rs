@@ -379,6 +379,20 @@ cfg_if::cfg_if! {
 mod tests {
     use super::*;
 
+    // Stack slot offsets from TOS (used by initialize()).
+    // See the layout diagram in the module documentation.
+    const SLOT_IP: usize = 0x08;
+    const SLOT_FP: usize = 0x10;
+    const SLOT_SP: usize = 0x18;
+    const SLOT_ARGS_CAPACITY: usize = 0x20;
+    // The following are relative to (TOS - SLOT_ARGS_BASE - args_data_size):
+    const SLOT_ARGS_BASE: usize = 0x28;
+    const SLOT_FUNC_REF: usize = 0x00; // relative to args base
+    const SLOT_CALLER_VMCTX: usize = 0x08; // relative to args base
+    const SLOT_ARGS_PTR: usize = 0x10; // relative to args base
+    const SLOT_RETURN_VALUE_COUNT: usize = 0x18; // relative to args base
+    const SLOT_INITIAL_SP_BASE: usize = 0x40; // TOS - this - args_data_size = initial SP
+
     #[test]
     fn test_control_context_layout_relationships() {
         // The control context fields must be 8 bytes apart, in order: SP, FP, IP.
@@ -423,5 +437,187 @@ mod tests {
     fn test_valraw_size() {
         // ValRaw must be 16 bytes to maintain stack alignment.
         assert_eq!(core::mem::size_of::<ValRaw>(), 16);
+    }
+
+    #[test]
+    fn test_initialize_stack_layout() {
+        // Allocate a real stack using the standard path.
+        let stack =
+            VMContinuationStack::new(64 * 1024).expect("failed to allocate continuation stack");
+        let tos = stack.top().expect("stack must have a top") as usize;
+
+        // Create a VMHostArray in the expected initial state (zeroed).
+        // Fields are public and initialize() asserts capacity/length are 0.
+        let mut args = VMHostArray::<ValRaw> {
+            length: 0,
+            capacity: 0,
+            data: ptr::null_mut(),
+        };
+
+        // Use small non-null sentinel values for pointers.
+        // These are never dereferenced, just stored and read back.
+        let func_ref_sentinel: *const VMFuncRef = 0x1111_usize as _;
+        let caller_vmctx_sentinel: *mut VMContext = 0x2222_usize as _;
+        let args_ptr: *mut VMHostArray<ValRaw> = &mut args;
+
+        // Test with args_capacity > 0: parameter_count=2, return_value_count=3 => capacity=3.
+        let parameter_count = 2u32;
+        let return_value_count = 3u32;
+        let expected_args_capacity = 3u32;
+        let args_data_size = expected_args_capacity as usize * core::mem::size_of::<ValRaw>();
+
+        stack.initialize(
+            func_ref_sentinel,
+            caller_vmctx_sentinel,
+            args_ptr,
+            parameter_count,
+            return_value_count,
+        );
+
+        // Read back all slots and verify exact matches.
+        unsafe {
+            let read_slot = |offset_from_tos: usize| -> usize {
+                let ptr = (tos - offset_from_tos) as *const usize;
+                *ptr
+            };
+
+            // Control context slots.
+            assert_eq!(
+                read_slot(SLOT_IP),
+                wasmtime_continuation_start_address() as usize,
+                "entry IP must be trampoline address"
+            );
+            assert_eq!(
+                read_slot(SLOT_FP),
+                tos - SLOT_FP, // FP points to itself in control context
+                "initial FP must point to FP slot (TOS - 0x10)"
+            );
+            let expected_initial_sp = tos - SLOT_INITIAL_SP_BASE - args_data_size;
+            assert_eq!(
+                read_slot(SLOT_SP),
+                expected_initial_sp,
+                "initial SP must be TOS - 0x40 - args_data_size"
+            );
+
+            // Verify accessor methods agree with raw reads.
+            assert_eq!(
+                stack.control_context_instruction_pointer(),
+                read_slot(SLOT_IP),
+                "accessor IP must match raw read"
+            );
+            assert_eq!(
+                stack.control_context_frame_pointer(),
+                read_slot(SLOT_FP),
+                "accessor FP must match raw read"
+            );
+            assert_eq!(
+                stack.control_context_stack_pointer(),
+                read_slot(SLOT_SP),
+                "accessor SP must match raw read"
+            );
+
+            // Header slot.
+            assert_eq!(
+                read_slot(SLOT_ARGS_CAPACITY),
+                expected_args_capacity as usize,
+                "args_capacity header"
+            );
+
+            // Argument slots (below args buffer).
+            let arg_base = SLOT_ARGS_BASE + args_data_size;
+            assert_eq!(
+                read_slot(arg_base + SLOT_FUNC_REF),
+                func_ref_sentinel as usize,
+                "func_ref slot"
+            );
+            assert_eq!(
+                read_slot(arg_base + SLOT_CALLER_VMCTX),
+                caller_vmctx_sentinel as usize,
+                "caller_vmctx slot"
+            );
+            assert_eq!(
+                read_slot(arg_base + SLOT_ARGS_PTR),
+                args_ptr as usize,
+                "args pointer slot (VMHostArray struct address)"
+            );
+            assert_eq!(
+                read_slot(arg_base + SLOT_RETURN_VALUE_COUNT),
+                return_value_count as usize,
+                "return_value_count slot"
+            );
+
+            // VMHostArray updates.
+            assert_eq!(args.capacity, expected_args_capacity, "args.capacity");
+            assert_eq!(
+                args.data as usize,
+                tos - SLOT_ARGS_CAPACITY - args_data_size,
+                "args.data pointer (start of args buffer)"
+            );
+
+            // Derived invariants.
+            assert_eq!(
+                expected_initial_sp % 16,
+                0,
+                "initial SP must be 16-byte aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn test_initialize_stack_layout_zero_args() {
+        let stack =
+            VMContinuationStack::new(64 * 1024).expect("failed to allocate continuation stack");
+        let tos = stack.top().expect("stack must have a top") as usize;
+
+        let mut args = VMHostArray::<ValRaw> {
+            length: 0,
+            capacity: 0,
+            data: ptr::null_mut(),
+        };
+
+        let func_ref_sentinel: *const VMFuncRef = 0x1111_usize as _;
+        let caller_vmctx_sentinel: *mut VMContext = 0x2222_usize as _;
+        let args_ptr: *mut VMHostArray<ValRaw> = &mut args;
+
+        // Both counts zero => args_capacity = 0, args_data_size = 0.
+        stack.initialize(func_ref_sentinel, caller_vmctx_sentinel, args_ptr, 0, 0);
+
+        unsafe {
+            let read_slot = |offset_from_tos: usize| -> usize {
+                let ptr = (tos - offset_from_tos) as *const usize;
+                *ptr
+            };
+
+            // Control context.
+            assert_eq!(
+                read_slot(SLOT_IP),
+                wasmtime_continuation_start_address() as usize
+            );
+            assert_eq!(read_slot(SLOT_FP), tos - SLOT_FP);
+            assert_eq!(read_slot(SLOT_SP), tos - SLOT_INITIAL_SP_BASE);
+
+            // Header.
+            assert_eq!(read_slot(SLOT_ARGS_CAPACITY), 0);
+
+            // Argument slots (no args buffer offset).
+            let arg_base = SLOT_ARGS_BASE;
+            assert_eq!(
+                read_slot(arg_base + SLOT_FUNC_REF),
+                func_ref_sentinel as usize
+            );
+            assert_eq!(
+                read_slot(arg_base + SLOT_CALLER_VMCTX),
+                caller_vmctx_sentinel as usize
+            );
+            assert_eq!(read_slot(arg_base + SLOT_ARGS_PTR), args_ptr as usize);
+            assert_eq!(read_slot(arg_base + SLOT_RETURN_VALUE_COUNT), 0);
+
+            // VMHostArray: capacity 0, data null.
+            assert_eq!(args.capacity, 0);
+            assert!(
+                args.data.is_null(),
+                "args.data must be null when capacity is 0"
+            );
+        }
     }
 }
