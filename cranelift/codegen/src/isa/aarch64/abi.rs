@@ -1534,6 +1534,12 @@ const WINCH_CLOBBERS: PRegSet = winch_clobbers();
 const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
 
+/// Returns the set of all clobbered registers.
+/// Used by pseudo-instructions like stack_switch that clobber everything.
+pub fn get_all_clobbers() -> PRegSet {
+    ALL_CLOBBERS
+}
+
 fn create_reg_env(enable_pinned_reg: bool) -> MachineEnv {
     fn preg(r: Reg) -> PReg {
         r.to_real_reg().unwrap().into()

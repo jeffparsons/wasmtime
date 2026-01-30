@@ -3619,6 +3619,157 @@ impl MachInstEmit for Inst {
                 .emit(sink, emit_info, state);
                 sink.bind_label(loop_end, &mut state.ctrl_plane);
             }
+
+            &Inst::StackSwitchBasic {
+                store_context_ptr,
+                load_context_ptr,
+                in_payload0,
+                out_payload0,
+            } => {
+                use crate::isa::aarch64::inst::stack_switch;
+
+                // Aliasing would break the swap sequence. CLIF semantics require distinct
+                // pointers: store_context_ptr receives the current state, load_context_ptr
+                // provides the target state. If they were the same, the caller would be
+                // switching to itself, which is not a meaningful operation.
+                debug_assert_ne!(
+                    store_context_ptr, load_context_ptr,
+                    "store_context_ptr and load_context_ptr must be distinct registers"
+                );
+
+                // The payload is passed via x0 and regalloc constrains in_payload0 and
+                // out_payload0 to x0. Nothing to emit for the payload itself.
+                let _ = (in_payload0, out_payload0);
+
+                // Select two temp registers deterministically from [x16, x17, x15, x14].
+                // x16/x17 are IP0/IP1 (intra-procedure scratch), conventional for veneers.
+                let operands = [store_context_ptr, load_context_ptr];
+                let candidates = [16u8, 17, 15, 14];
+                let mut temps = candidates
+                    .iter()
+                    .filter(|&&n| !operands.contains(&regs::xreg(n)))
+                    .map(|&n| regs::writable_xreg(n));
+                let tmp1 = temps.next().expect("need at least one temp register");
+                let tmp2 = temps.next().expect("need at least two temp registers");
+
+                let layout = stack_switch::control_context_layout();
+                let sp_off = layout.stack_pointer_offset as i64;
+                let fp_off = layout.frame_pointer_offset as i64;
+                let pc_off = layout.ip_offset as i64;
+
+                let resume = sink.get_label();
+
+                // === Exchange SP ===
+                // ldr tmp1, [load_ctx, #sp_off]
+                Inst::ULoad64 {
+                    rd: tmp1,
+                    mem: AMode::UnsignedOffset {
+                        rn: load_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(sp_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // mov tmp2, sp
+                Inst::Mov {
+                    size: OperandSize::Size64,
+                    rd: tmp2,
+                    rm: regs::stack_reg(),
+                }
+                .emit(sink, emit_info, state);
+
+                // str tmp2, [store_ctx, #sp_off]
+                Inst::Store64 {
+                    rd: tmp2.to_reg(),
+                    mem: AMode::UnsignedOffset {
+                        rn: store_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(sp_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // add sp, tmp1, #0  (canonical way to mov into sp)
+                Inst::AluRRImm12 {
+                    alu_op: ALUOp::Add,
+                    size: OperandSize::Size64,
+                    rd: regs::writable_stack_reg(),
+                    rn: tmp1.to_reg(),
+                    imm12: Imm12::ZERO,
+                }
+                .emit(sink, emit_info, state);
+
+                // === Exchange FP (x29) ===
+                // ldr tmp1, [load_ctx, #fp_off]
+                Inst::ULoad64 {
+                    rd: tmp1,
+                    mem: AMode::UnsignedOffset {
+                        rn: load_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(fp_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // str x29, [store_ctx, #fp_off]
+                Inst::Store64 {
+                    rd: regs::fp_reg(),
+                    mem: AMode::UnsignedOffset {
+                        rn: store_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(fp_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // mov x29, tmp1
+                Inst::Mov {
+                    size: OperandSize::Size64,
+                    rd: regs::writable_fp_reg(),
+                    rm: tmp1.to_reg(),
+                }
+                .emit(sink, emit_info, state);
+
+                // === Exchange IP and branch ===
+                // ldr tmp1, [load_ctx, #pc_off]
+                Inst::ULoad64 {
+                    rd: tmp1,
+                    mem: AMode::UnsignedOffset {
+                        rn: load_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(pc_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // adr tmp2, resume  (PC-relative address of resume label)
+                // Pattern: capture offset BEFORE emit, then use_label_at_offset
+                let adr_offset = sink.cur_offset();
+                Inst::Adr { rd: tmp2, off: 0 }.emit(sink, emit_info, state);
+                sink.use_label_at_offset(adr_offset, resume, LabelUse::Adr21);
+
+                // str tmp2, [store_ctx, #pc_off]
+                Inst::Store64 {
+                    rd: tmp2.to_reg(),
+                    mem: AMode::UnsignedOffset {
+                        rn: store_context_ptr,
+                        uimm12: UImm12Scaled::maybe_from_i64(pc_off, I64).unwrap(),
+                    },
+                    flags: MemFlags::trusted(),
+                }
+                .emit(sink, emit_info, state);
+
+                // br tmp1  (indirect branch to target PC)
+                Inst::IndirectBr {
+                    rn: tmp1.to_reg(),
+                    targets: vec![],
+                }
+                .emit(sink, emit_info, state);
+
+                // resume:
+                sink.bind_label(resume, &mut state.ctrl_plane);
+            }
         }
 
         let end_off = sink.cur_offset();

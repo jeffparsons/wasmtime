@@ -27,6 +27,8 @@ use crate::isa::aarch64::abi::AArch64MachineDeps;
 
 pub(crate) mod unwind;
 
+pub mod stack_switch;
+
 #[cfg(test)]
 mod emit_tests;
 
@@ -923,6 +925,30 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::StackProbeLoop { start, end, .. } => {
             collector.reg_early_def(start);
             collector.reg_use(end);
+        }
+        Inst::StackSwitchBasic {
+            store_context_ptr,
+            load_context_ptr,
+            in_payload0,
+            out_payload0,
+        } => {
+            collector.reg_use(load_context_ptr);
+            collector.reg_use(store_context_ptr);
+            collector.reg_fixed_use(in_payload0, stack_switch::payload_register());
+            collector.reg_fixed_def(out_payload0, stack_switch::payload_register());
+
+            // Clobber all allocatable registers except the payload register (x0).
+            // This includes x1-x28 and v0-v31. SP is not allocatable. x29 (FP) is
+            // the fixed frame pointer; this instruction swaps its value as part of
+            // the control-context switch (it is modified, not preserved).
+            let mut clobbers = crate::isa::aarch64::abi::get_all_clobbers();
+            clobbers.remove(
+                stack_switch::payload_register()
+                    .to_real_reg()
+                    .unwrap()
+                    .into(),
+            );
+            collector.reg_clobbers(clobbers);
         }
     }
 }
@@ -2906,6 +2932,18 @@ impl Inst {
                 let end = pretty_print_reg(end);
                 let step = step.pretty_print(0);
                 format!("stack_probe_loop {start}, {end}, {step}")
+            }
+            &Inst::StackSwitchBasic {
+                store_context_ptr,
+                load_context_ptr,
+                in_payload0,
+                ref out_payload0,
+            } => {
+                let store = pretty_print_reg(store_context_ptr);
+                let load = pretty_print_reg(load_context_ptr);
+                let in_p = pretty_print_reg(in_payload0);
+                let out_p = pretty_print_reg(out_payload0.to_reg());
+                format!("{out_p} = stack_switch_basic {store}, {load}, {in_p}")
             }
         }
     }
