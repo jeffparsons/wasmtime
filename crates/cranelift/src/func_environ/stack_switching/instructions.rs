@@ -9,8 +9,12 @@ use cranelift_frontend::FunctionBuilder;
 use wasmtime_environ::{PtrSize, TagIndex, TypeIndex, WasmResult, WasmValType, wasm_unsupported};
 
 fn control_context_size(triple: &target_lexicon::Triple) -> WasmResult<u8> {
-    match (triple.architecture, triple.operating_system) {
-        (target_lexicon::Architecture::X86_64, target_lexicon::OperatingSystem::Linux) => Ok(24),
+    use target_lexicon::{Architecture, OperatingSystem};
+    match (&triple.architecture, &triple.operating_system) {
+        (Architecture::X86_64, OperatingSystem::Linux) => Ok(24),
+        (Architecture::Aarch64(_), OperatingSystem::MacOSX(_) | OperatingSystem::Darwin(_)) => {
+            Ok(24)
+        }
         _ => Err(wasm_unsupported!(
             "stack switching not supported on {triple}"
         )),
