@@ -52,8 +52,10 @@ mod stack_overflow;
 mod store;
 mod structs;
 mod table;
-#[cfg(all(feature = "stack-switching", unix, target_arch = "x86_64"))]
+#[cfg(all(feature = "stack-switching", unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tags;
+#[cfg(all(feature = "stack-switching", unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod continuations;
 mod threads;
 mod traps;
 mod types;
