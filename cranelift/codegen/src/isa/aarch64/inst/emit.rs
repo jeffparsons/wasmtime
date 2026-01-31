@@ -3628,14 +3628,13 @@ impl MachInstEmit for Inst {
             } => {
                 use crate::isa::aarch64::inst::stack_switch;
 
-                // Aliasing would break the swap sequence. CLIF semantics require distinct
-                // pointers: store_context_ptr receives the current state, load_context_ptr
-                // provides the target state. If they were the same, the caller would be
-                // switching to itself, which is not a meaningful operation.
-                debug_assert_ne!(
-                    store_context_ptr, load_context_ptr,
-                    "store_context_ptr and load_context_ptr must be distinct registers"
-                );
+                // Note: load_context_ptr and store_context_ptr may be the same register.
+                // CLIF explicitly allows aliasing and requires "all data is loaded from
+                // the former before writing to the latter." The sequence below satisfies
+                // this by doing per-field load-before-store: each ldr [ctx+N] happens
+                // before the corresponding str [ctx+N], and later loads use the ctx base
+                // register (not sp), so aliasing with non-overlapping offsets (0/8/16)
+                // is safe. This matches x86_64's approach.
 
                 // The payload is passed via x0 and regalloc constrains in_payload0 and
                 // out_payload0 to x0. Nothing to emit for the payload itself.
