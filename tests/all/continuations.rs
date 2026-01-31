@@ -48,7 +48,10 @@ fn continuation_roundtrip() -> Result<()> {
     "#;
 
     let mut config = Config::new();
-    config.wasm_exceptions(true).wasm_stack_switching(true);
+    config
+        .wasm_function_references(true)
+        .wasm_exceptions(true)
+        .wasm_stack_switching(true);
     let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, ());
     let module = Module::new(&engine, source)?;
