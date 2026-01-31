@@ -3626,6 +3626,8 @@ impl MachInstEmit for Inst {
                 in_payload0,
                 out_payload0,
             } => {
+                // Note: No unwind metadata is emitted for stack_switch.
+                // See the trampoline documentation in stack_switching/stack/unix/ for rationale.
                 use crate::isa::aarch64::inst::stack_switch;
 
                 // Note: load_context_ptr and store_context_ptr may be the same register.

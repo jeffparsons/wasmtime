@@ -40,8 +40,57 @@ pub fn wasmtime_continuation_start_address() -> *const () {
 pub(crate) unsafe extern "C" fn wasmtime_continuation_start() {
     naked_asm!(
         "
-        // TODO: Restore DWARF CFI directives for unwinding. In the meantime,
-        // debugging is possible using frame pointer walking.
+        // ===========================================================================
+        // Unwinding and Backtraces
+        // ===========================================================================
+        //
+        // Two distinct mechanisms exist for walking the call stack:
+        //
+        // - Frame-pointer walking (following x29 chains): WORKS
+        // - DWARF/libunwind-based unwinding: DOES NOT WORK
+        //
+        // This distinction matters: 'backtraces work' here means FP-based walking,
+        // not debugger-quality DWARF unwinding.
+        //
+        // What works:
+        // - Continuation backtraces via frame-pointer walking work on macOS/aarch64
+        // - The continuation stack is initialized with an FP slot pointing to itself
+        // - The trampoline preserves and restores x29 consistently
+        // - Control context layout (SP @ 0, FP @ 8, PC @ 16) plus per-field
+        //   load/store ordering ensures FP chain validity across suspend/resume
+        //
+        // What doesn't work:
+        // - DWARF/libunwind-based unwinding is not reliable across:
+        //   - wasmtime_continuation_start (entered via indirect branch,
+        //     nonstandard prologue)
+        //   - stack_switch (no Cranelift-emitted unwind metadata)
+        // - No CFI is emitted for the trampoline or stack switch
+        //
+        // macOS-specific expectations:
+        // - LLDB backtraces may stop at wasmtime_continuation_start
+        // - This is expected behavior given the lack of CFI
+        // - Tools that rely purely on DWARF unwind info will produce partial traces
+        //
+        // Why this is intentional and sufficient:
+        // - Design prioritizes correctness and portability of stack switching
+        // - FP-based backtraces are sufficient for internal debugging and crash
+        //   analysis
+        // - This mirrors the current state on x86_64
+        // - CFI support is deferred until stack-switching semantics are stable
+        //
+        // Future work (separate phase):
+        // Adding CFI is non-trivial due to:
+        // - Indirect branches (trampoline entered via br)
+        // - Multiple stacks (continuation vs parent)
+        // - SP/FP swaps mid-instruction sequence in stack_switch
+        //
+        // Trampoline CFI would follow fiber crate's aarch64 patterns. Full solution
+        // requires Cranelift machinst unwind directives for StackSwitchBasic.
+        //
+        // Practical guidance:
+        // When debugging continuation issues on macOS/aarch64, prefer FP-based
+        // backtraces or explicit logging around suspend/resume boundaries.
+        // ===========================================================================
 
         //
         // Load the 4 arguments for fiber_start from the stack into registers.

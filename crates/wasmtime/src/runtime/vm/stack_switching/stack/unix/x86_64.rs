@@ -40,9 +40,51 @@ pub fn wasmtime_continuation_start_address() -> *const () {
 pub(crate) unsafe extern "C" fn wasmtime_continuation_start() {
     naked_asm!(
         "
-        // TODO(frank-emrich): Restore DWARF information for this function. In
-        // the meantime, debugging is possible using frame pointer walking.
-
+        // ===========================================================================
+        // Unwinding and Backtraces
+        // ===========================================================================
+        //
+        // Two distinct mechanisms exist for walking the call stack:
+        //
+        // - Frame-pointer walking (following RBP chains): WORKS
+        // - DWARF/libunwind-based unwinding: DOES NOT WORK
+        //
+        // This distinction matters: 'backtraces work' here means FP-based walking,
+        // not debugger-quality DWARF unwinding.
+        //
+        // What works:
+        // - Continuation backtraces via frame-pointer walking work on x86_64
+        // - The continuation stack is initialized with an FP slot pointing to itself
+        // - The trampoline preserves and restores RBP consistently
+        // - Control context layout (SP @ 0, FP @ 8, PC @ 16) plus per-field
+        //   load/store ordering ensures FP chain validity across suspend/resume
+        //
+        // What doesn't work:
+        // - DWARF/libunwind-based unwinding is not reliable across:
+        //   - wasmtime_continuation_start (entered via indirect branch,
+        //     nonstandard prologue)
+        //   - stack_switch (no Cranelift-emitted unwind metadata)
+        // - No CFI is emitted for the trampoline or stack switch
+        //
+        // Why this is intentional and sufficient:
+        // - Design prioritizes correctness and portability of stack switching
+        // - FP-based backtraces are sufficient for internal debugging and crash
+        //   analysis
+        // - CFI support is deferred until stack-switching semantics are stable
+        //
+        // Future work (separate phase):
+        // Adding CFI is non-trivial due to:
+        // - Indirect branches (trampoline entered via jmp)
+        // - Multiple stacks (continuation vs parent)
+        // - SP/FP swaps mid-instruction sequence in stack_switch
+        //
+        // Trampoline CFI would follow fiber crate's x86_64 patterns. Full solution
+        // requires Cranelift machinst unwind directives for StackSwitchBasic.
+        //
+        // Practical guidance:
+        // When debugging continuation issues on x86_64, prefer FP-based backtraces
+        // or explicit logging around suspend/resume boundaries.
+        // ===========================================================================
 
         //
         // Note that the next 4 instructions amount to calling fiber_start
