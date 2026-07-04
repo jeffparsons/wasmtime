@@ -100,15 +100,14 @@ fn flat_list_record() -> Result<()> {
     let func = instance.get_func(&mut store, "echo").unwrap();
 
     let ty = func.ty(&store);
-    assert!(
-        ty.params()
-            .next()
-            .unwrap()
-            .1
-            .unwrap_list()
-            .ty()
-            .is_cabi_inline()
-    );
+    assert!(ty
+        .params()
+        .next()
+        .unwrap()
+        .1
+        .unwrap_list()
+        .ty()
+        .is_cabi_inline());
     drop(ty);
 
     let points = [(1.0f32, 2.0f32), (3.5, -4.25), (-0.0, 100.0)];
@@ -315,5 +314,136 @@ fn flat_ragged_length_errors() -> Result<()> {
             .contains("not a multiple of the element size"),
         "unexpected error: {err}"
     );
+    Ok(())
+}
+
+fn read_u32s(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// `invoke_scoped` exposes a `list<u32>` result as a zero-copy view, an owned
+/// copy, and a `Val` — the same result read three ways in one scope.
+#[test]
+fn scoped_read_list() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    let values = [5u32, 6, 7, 8, 9];
+    let prepared = func.prepare_call(&store, &[ArgSpec::Flat])?;
+
+    let seen = prepared
+        .bind()
+        .arg(ArgSource::Flat(&u32_list_bytes(&values)))
+        .invoke_scoped(&mut store, |results| {
+            assert_eq!(results.len(), 1);
+
+            // Zero-copy view of the guest's canonical bytes.
+            let view = results.view(0)?;
+            assert_eq!(read_u32s(view), values);
+
+            // An owned copy matches the view.
+            assert_eq!(results.copy(0)?, view);
+
+            // The same result lifted as a `Val` (the view is still valid: it
+            // borrows guest memory for the whole scope, not the accessor).
+            let val = results.val(0)?;
+            assert_eq!(
+                val,
+                Val::List(values.iter().copied().map(Val::U32).collect())
+            );
+            assert_eq!(read_u32s(view), values);
+
+            Ok(read_u32s(view))
+        })?;
+
+    assert_eq!(seen, values);
+    Ok(())
+}
+
+/// `view` is rejected for a non-list (here scalar) result, while `val` works.
+#[test]
+fn scoped_view_rejects_non_list() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params("u32", &[super::Param(super::Type::I32, Some(0))]),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    func.prepare_call(&store, &[ArgSpec::Val])?
+        .bind()
+        .arg(ArgSource::Val(Val::U32(1234)))
+        .invoke_scoped(&mut store, |results| {
+            let err = results.view(0).unwrap_err();
+            assert!(err.to_string().contains("is not a list"), "{err}");
+            assert_eq!(results.val(0)?, Val::U32(1234));
+            Ok(())
+        })?;
+    Ok(())
+}
+
+/// `val` reads a result returned indirectly whose value is a tuple containing a
+/// list, exercising the memory-load path.
+#[test]
+fn scoped_val_tuple_with_list() -> Result<()> {
+    // Returns `tuple<list<u32>, u32>` (one result, returned via a pointer). The
+    // core body echoes the incoming list and appends a constant scalar.
+    let component = format!(
+        r#"
+        (component
+            (core module $m
+                (func (export "run") (param i32 i32) (result i32)
+                    (local $base i32)
+                    (local.set $base
+                        (call $realloc (i32.const 0) (i32.const 0) (i32.const 4) (i32.const 12)))
+                    (i32.store offset=0 (local.get $base) (local.get 0))
+                    (i32.store offset=4 (local.get $base) (local.get 1))
+                    (i32.store offset=8 (local.get $base) (i32.const 99))
+                    (local.get $base)
+                )
+                (memory (export "memory") 1)
+                {REALLOC_AND_FREE}
+            )
+            (core instance $i (instantiate $m))
+            (type $L (list u32))
+            (type $T (tuple $L u32))
+            (func (export "run") (param "a" $L) (result $T)
+                (canon lift
+                    (core func $i "run")
+                    (memory $i "memory")
+                    (realloc (func $i "realloc"))
+                )
+            )
+        )"#
+    );
+
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(&engine, component)?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "run").unwrap();
+
+    let values = [1u32, 2, 3];
+    func.prepare_call(&store, &[ArgSpec::Flat])?
+        .bind()
+        .arg(ArgSource::Flat(&u32_list_bytes(&values)))
+        .invoke_scoped(&mut store, |results| {
+            assert_eq!(
+                results.val(0)?,
+                Val::Tuple(vec![
+                    Val::List(values.iter().copied().map(Val::U32).collect()),
+                    Val::U32(99),
+                ])
+            );
+            Ok(())
+        })?;
     Ok(())
 }

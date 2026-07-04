@@ -26,18 +26,22 @@
 //! ([`ArgSpec::Val`] / [`ArgSource::Val`]), so a single call freely mixes the
 //! two representations.
 //!
-//! Results are read back as [`Val`]s, exactly as with
-//! [`Func::call`](crate::component::Func::call); a zero-copy result-reading
-//! surface is intended as a follow-up.
+//! Results can be read back as [`Val`]s ([`BoundCall::invoke`]), exactly as with
+//! [`Func::call`](crate::component::Func::call), or — via
+//! [`BoundCall::invoke_scoped`] — read in place from guest memory without copying
+//! them out, choosing a zero-copy byte view, an owned copy, or a dynamic [`Val`]
+//! per result.
 
 use crate::component::Func;
-use crate::component::func::LowerContext;
+use crate::component::func::{LiftContext, LowerContext};
 use crate::component::types::Type;
 use crate::component::values::Val;
 use crate::prelude::*;
 use crate::{AsContext, AsContextMut, ValRaw};
 use core::mem::MaybeUninit;
-use wasmtime_environ::component::{InterfaceType, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS, TypeTuple};
+use wasmtime_environ::component::{
+    ComponentTypes, InterfaceType, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS, TypeTuple, TypeTupleIndex,
+};
 
 /// How a single argument to a [`PreparedCall`] will be supplied, chosen once
 /// when the call is prepared.
@@ -157,7 +161,72 @@ impl<'a> BoundCall<'a> {
     /// # Panics
     ///
     /// Panics if `store` does not own the underlying function.
-    pub fn invoke(self, mut store: impl AsContextMut, results: &mut [Val]) -> Result<()> {
+    pub fn invoke(self, store: impl AsContextMut, results: &mut [Val]) -> Result<()> {
+        self.run(store, |cx, results_ty, src| {
+            let tuple = match results_ty {
+                InterfaceType::Tuple(i) => &cx.types[i],
+                _ => unreachable!(),
+            };
+            if tuple.types.len() != results.len() {
+                bail!(
+                    "expected {} result(s), got {}",
+                    tuple.types.len(),
+                    results.len()
+                );
+            }
+            for (result, slot) in
+                Func::lift_results(cx, results_ty, src, MAX_FLAT_RESULTS)?.zip(results)
+            {
+                *slot = result?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Invoke the function and read its results in place, without copying them
+    /// out of guest memory.
+    ///
+    /// Runs the guest and then hands a borrowed [`Results`] accessor to `f`.
+    /// Within `f`, each result can be read as a zero-copy byte view
+    /// ([`Results::view`]), an owned byte copy ([`Results::copy`]), or a dynamic
+    /// [`Val`] ([`Results::val`]), chosen independently per result. The borrows
+    /// handed to `f` are confined to it — they cannot escape — and the guest's
+    /// `post-return` runs after `f` returns.
+    ///
+    /// This is the zero-copy counterpart to [`invoke`](Self::invoke): use it when
+    /// the host wants to read guest-produced inline data (for example a
+    /// `list<T>`) in place rather than materializing it as [`Val`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the same argument/spec problems as
+    /// [`invoke`](Self::invoke), if a trap occurs, or if `f` itself returns an
+    /// error (for example from requesting a [`view`](Results::view) of a
+    /// non-inline result).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own the underlying function.
+    pub fn invoke_scoped<R>(
+        self,
+        store: impl AsContextMut,
+        f: impl FnOnce(&mut Results<'_, '_>) -> Result<R>,
+    ) -> Result<R> {
+        self.run(store, |cx, results_ty, src| {
+            let mut results = Results::new(cx, results_ty, src)?;
+            f(&mut results)
+        })
+    }
+
+    /// Shared invocation machinery for [`invoke`](Self::invoke) and
+    /// [`invoke_scoped`](Self::invoke_scoped): validate the binding, lower the
+    /// arguments, run the guest, lift the results via `lift`, then run
+    /// `post-return`.
+    fn run<R>(
+        self,
+        mut store: impl AsContextMut,
+        lift: impl FnOnce(&mut LiftContext<'_>, InterfaceType, &[ValRaw; MAX_FLAT_RESULTS]) -> Result<R>,
+    ) -> Result<R> {
         let mut store = store.as_context_mut();
         store.0.validate_sync_call()?;
 
@@ -173,16 +242,6 @@ impl<'a> BoundCall<'a> {
             );
         }
 
-        let ty = func.ty(store.as_context());
-        if ty.results().len() != results.len() {
-            bail!(
-                "expected {} result(s), got {}",
-                ty.results().len(),
-                results.len()
-            );
-        }
-        drop(ty);
-
         if func.abi_async(store.0) {
             unreachable!(
                 "async-lifted exports should have failed validation \
@@ -195,9 +254,9 @@ impl<'a> BoundCall<'a> {
         // maximal flat-result array, both as `ValRaw`. The lowering closure
         // fills the parameter storage to match the function's actual parameter
         // types (either flattened onto the stack or, for larger signatures,
-        // stored behind a single pointer), and the lifting closure interprets
-        // the results using the function's actual result types.
-        let (_, post_return_arg) = unsafe {
+        // stored behind a single pointer), and `lift` interprets the results
+        // using the function's actual result types.
+        let (value, post_return_arg) = unsafe {
             func.call_raw(
                 store.as_context_mut(),
                 |cx, params_ty, dst: &mut MaybeUninit<[MaybeUninit<ValRaw>; MAX_FLAT_PARAMS]>| {
@@ -207,18 +266,12 @@ impl<'a> BoundCall<'a> {
                     let dst: &mut [MaybeUninit<ValRaw>] = dst.assume_init_mut();
                     lower_sources(cx, specs, sources, params_ty, dst)
                 },
-                |cx, results_ty, src: &[ValRaw; MAX_FLAT_RESULTS]| {
-                    for (result, slot) in
-                        Func::lift_results(cx, results_ty, src, MAX_FLAT_RESULTS)?.zip(results)
-                    {
-                        *slot = result?;
-                    }
-                    Ok(())
-                },
+                lift,
             )?
         };
 
-        func.post_return_impl(store, post_return_arg)
+        func.post_return_impl(store, post_return_arg)?;
+        Ok(value)
     }
 }
 
@@ -284,6 +337,185 @@ impl Func {
             func: *self,
             specs: specs.to_vec(),
         })
+    }
+}
+
+/// A borrowed accessor over a call's results, handed to the closure passed to
+/// [`BoundCall::invoke_scoped`].
+///
+/// Each result can be read as a zero-copy byte view ([`view`](Self::view)), an
+/// owned byte copy ([`copy`](Self::copy)), or a dynamic [`Val`]
+/// ([`val`](Self::val)), chosen independently per result. Views borrow guest
+/// memory and are valid only until the accessor's closure returns; the borrow
+/// checker prevents them from escaping it.
+pub struct Results<'a, 'b> {
+    cx: &'a mut LiftContext<'b>,
+    /// The results tuple type.
+    results_ty: TypeTupleIndex,
+    /// The flattened core result values. When the results are returned
+    /// indirectly this is instead a single pointer to the results block, which
+    /// [`Results::new`] resolves into `indirect`.
+    src: &'a [ValRaw],
+    /// For an indirectly-returned result tuple, the base pointer of the tuple in
+    /// guest memory and the byte offset of each result within it. `None` when the
+    /// results are returned flat (0 or 1 core values).
+    indirect: Option<(usize, Vec<usize>)>,
+}
+
+impl<'a, 'b> Results<'a, 'b> {
+    fn new(
+        cx: &'a mut LiftContext<'b>,
+        results_ty: InterfaceType,
+        src: &'a [ValRaw],
+    ) -> Result<Self> {
+        let results_ty = match results_ty {
+            InterfaceType::Tuple(i) => i,
+            _ => unreachable!(),
+        };
+        let tuple = &cx.types[results_ty];
+        let indirect = if tuple.abi.flat_count(MAX_FLAT_RESULTS).is_some() {
+            None
+        } else {
+            // FIXME(#4311): needs to read an i64 for memory64
+            let ptr = usize::try_from(src[0].get_u32())?;
+            if ptr % usize::try_from(tuple.abi.align32)? != 0 {
+                bail!("return pointer not aligned");
+            }
+            let size = usize::try_from(tuple.abi.size32).unwrap();
+            cx.memory()
+                .get(ptr..)
+                .and_then(|b| b.get(..size))
+                .ok_or_else(|| crate::format_err!("pointer out of bounds of memory"))?;
+            let mut offset = 0;
+            let offsets = tuple
+                .types
+                .iter()
+                .map(|ty| cx.types.canonical_abi(ty).next_field32_size(&mut offset))
+                .collect();
+            Some((ptr, offsets))
+        };
+        Ok(Results {
+            cx,
+            results_ty,
+            src,
+            indirect,
+        })
+    }
+
+    /// The number of results.
+    pub fn len(&self) -> usize {
+        self.cx.types[self.results_ty].types.len()
+    }
+
+    /// Returns `true` if the function has no results.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn result_type(&self, index: usize) -> Result<InterfaceType> {
+        self.cx.types[self.results_ty]
+            .types
+            .get(index)
+            .copied()
+            .ok_or_else(|| crate::format_err!("result index {index} out of bounds"))
+    }
+
+    /// Read result `index` as a zero-copy view of its canonical-ABI bytes.
+    ///
+    /// Only valid when the result is a `list<T>` whose element type is
+    /// [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline); the
+    /// returned slice is the list's elements laid out back-to-back exactly as
+    /// they appear in guest memory. Returns an error for any other result type —
+    /// use [`val`](Self::val) for those.
+    pub fn view(&self, index: usize) -> Result<&'b [u8]> {
+        let ty = self.result_type(index)?;
+        let element = match ty {
+            InterfaceType::List(i) => self.cx.types[i].element,
+            _ => bail!("result {index} is not a list; only list results can be viewed as bytes"),
+        };
+        if !interface_type_is_cabi_inline(self.cx.types, &element) {
+            bail!(
+                "result {index} is a list whose element type is not cabi-inline; \
+                 read it with `val` instead"
+            );
+        }
+        // A list result is always returned indirectly (its pointer/length pair is
+        // two core values, exceeding MAX_FLAT_RESULTS), so `indirect` is `Some`.
+        let (base, offsets) = self
+            .indirect
+            .as_ref()
+            .expect("a list result is always returned indirectly");
+        let field = base + offsets[index];
+        let memory = self.cx.memory();
+        // FIXME(#4311): needs memory64 handling
+        let ptr = usize::try_from(u32::from_le_bytes(memory[field..][..4].try_into().unwrap()))?;
+        let len = usize::try_from(u32::from_le_bytes(
+            memory[field + 4..][..4].try_into().unwrap(),
+        ))?;
+        let elt_size = usize::try_from(self.cx.types.canonical_abi(&element).size32).unwrap();
+        let byte_len = len
+            .checked_mul(elt_size)
+            .ok_or_else(|| crate::format_err!("list size overflow"))?;
+        memory
+            .get(ptr..)
+            .and_then(|b| b.get(..byte_len))
+            .ok_or_else(|| crate::format_err!("list out of bounds of memory"))
+    }
+
+    /// Read result `index` as an owned copy of its canonical-ABI bytes.
+    ///
+    /// Equivalent to [`view`](Self::view) followed by `.to_vec()`, and subject to
+    /// the same restrictions.
+    pub fn copy(&self, index: usize) -> Result<Vec<u8>> {
+        Ok(self.view(index)?.to_vec())
+    }
+
+    /// Read result `index` as a dynamic [`Val`]. Works for any result type.
+    pub fn val(&mut self, index: usize) -> Result<Val> {
+        let ty = self.result_type(index)?;
+        match &self.indirect {
+            Some((base, offsets)) => {
+                let field = base + offsets[index];
+                let size = usize::try_from(self.cx.types.canonical_abi(&ty).size32).unwrap();
+                // Copy the field's bytes out so the shared borrow of memory ends
+                // before `Val::load` takes `cx` mutably.
+                let bytes = self.cx.memory()[field..][..size].to_vec();
+                Val::load(self.cx, ty, &bytes)
+            }
+            None => {
+                // Flat results: at most MAX_FLAT_RESULTS core values total, so
+                // lifting reads directly from `src`.
+                let mut flat = self.src.iter();
+                Val::lift(self.cx, ty, &mut flat)
+            }
+        }
+    }
+}
+
+/// The [`InterfaceType`] counterpart of
+/// [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline), used to gate
+/// the zero-copy [`Results::view`] path. Kept in sync with that method.
+fn interface_type_is_cabi_inline(types: &ComponentTypes, ty: &InterfaceType) -> bool {
+    match ty {
+        InterfaceType::S8
+        | InterfaceType::U8
+        | InterfaceType::S16
+        | InterfaceType::U16
+        | InterfaceType::S32
+        | InterfaceType::U32
+        | InterfaceType::S64
+        | InterfaceType::U64
+        | InterfaceType::Float32
+        | InterfaceType::Float64 => true,
+        InterfaceType::Record(i) => types[*i]
+            .fields
+            .iter()
+            .all(|f| interface_type_is_cabi_inline(types, &f.ty)),
+        InterfaceType::Tuple(i) => types[*i]
+            .types
+            .iter()
+            .all(|t| interface_type_is_cabi_inline(types, t)),
+        _ => false,
     }
 }
 

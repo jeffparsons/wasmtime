@@ -127,7 +127,7 @@ pub use self::concurrent::{
 };
 pub use self::func::{
     ArgSource, ArgSpec, BoundCall, ComponentNamedList, ComponentType, Func, Lift, Lower,
-    PreparedCall, TypedFunc, WasmList, WasmStr,
+    PreparedCall, Results, TypedFunc, WasmList, WasmStr,
 };
 pub use self::has_data::*;
 pub use self::instance::{Instance, InstancePre};
