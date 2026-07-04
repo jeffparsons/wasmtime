@@ -17,9 +17,11 @@ use wasmtime_environ::component::{
 
 mod host;
 mod options;
+mod prepared;
 mod typed;
 pub use self::host::*;
 pub use self::options::*;
+pub use self::prepared::*;
 pub use self::typed::*;
 
 /// A WebAssembly component function which can be called.
@@ -424,7 +426,7 @@ impl Func {
     /// `LowerParams` and `LowerReturn` type. They must match the type of `self`
     /// for the params/results that are going to be produced. Additionally
     /// these types must be representable with a sequence of `ValRaw` values.
-    unsafe fn call_raw<T, Return, LowerParams, LowerReturn>(
+    pub(crate) unsafe fn call_raw<T, Return, LowerParams, LowerReturn>(
         &self,
         mut store: StoreContextMut<'_, T>,
         lower: impl FnOnce(

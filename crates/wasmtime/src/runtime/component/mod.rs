@@ -126,7 +126,8 @@ pub use self::concurrent::{
     VMComponentAsyncStore, VecBuffer, WriteBuffer,
 };
 pub use self::func::{
-    ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,
+    ArgSource, ArgSpec, BoundCall, ComponentNamedList, ComponentType, Func, Lift, Lower,
+    PreparedCall, TypedFunc, WasmList, WasmStr,
 };
 pub use self::has_data::*;
 pub use self::instance::{Instance, InstancePre};

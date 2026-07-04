@@ -741,6 +741,64 @@ pub enum Type {
 }
 
 impl Type {
+    /// Returns whether a value of this type has a fixed canonical-ABI byte
+    /// layout that can be transferred as raw bytes with a single `memcpy`,
+    /// requiring no per-element validation.
+    ///
+    /// This is `true` only for types with no out-of-line storage, no ownership,
+    /// and no invalid bit patterns: the signed and unsigned integers,
+    /// [`Float32`](Type::Float32), [`Float64`](Type::Float64), and
+    /// [`record`](Type::Record)s and [`tuple`](Type::Tuple)s composed
+    /// transitively of only those. Because every bit pattern of such a type is a
+    /// valid value, its canonical image can be copied verbatim without
+    /// inspecting the contents.
+    ///
+    /// It is `false` for [`bool`](Type::Bool), [`char`](Type::Char),
+    /// [`enum`](Type::Enum), and [`flags`](Type::Flags) (which have invalid bit
+    /// patterns that would require validation), and for [`string`](Type::String),
+    /// [`list`](Type::List), [`option`](Type::Option), [`result`](Type::Result),
+    /// [`variant`](Type::Variant), resources, [`future`](Type::Future),
+    /// [`stream`](Type::Stream), and [`error-context`](Type::ErrorContext) (which
+    /// carry out-of-line storage, discriminants, or ownership).
+    ///
+    /// This is the reflection gate that makes the bulk fast path of
+    /// [`Func::prepare_call`](crate::component::Func::prepare_call) legal: an
+    /// argument provided as pre-encoded canonical bytes
+    /// ([`ArgSource::Flat`](crate::component::ArgSource::Flat)) is accepted only
+    /// when the parameter is a `list` whose element type satisfies this
+    /// predicate.
+    pub fn is_cabi_inline(&self) -> bool {
+        match self {
+            Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64 => true,
+            Type::Record(r) => r.fields().all(|f| f.ty.is_cabi_inline()),
+            Type::Tuple(t) => t.types().all(|ty| ty.is_cabi_inline()),
+            Type::Bool
+            | Type::Char
+            | Type::String
+            | Type::List(_)
+            | Type::Map(_)
+            | Type::Variant(_)
+            | Type::Enum(_)
+            | Type::Option(_)
+            | Type::Result(_)
+            | Type::Flags(_)
+            | Type::Own(_)
+            | Type::Borrow(_)
+            | Type::Future(_)
+            | Type::Stream(_)
+            | Type::ErrorContext => false,
+        }
+    }
+
     /// Retrieve the inner [`List`] of a [`Type::List`].
     ///
     /// # Panics
