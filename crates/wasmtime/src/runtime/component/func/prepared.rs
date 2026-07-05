@@ -19,10 +19,10 @@
 //!
 //! An argument declared [`ArgSpec::Flat`] is supplied as a borrowed byte slice
 //! holding the parameter's canonical-ABI image ([`ArgSource::Flat`]); provided
-//! the parameter is a `list<T>` whose element type is
-//! [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline), those bytes
-//! are copied into guest memory with a single `memcpy` rather than element by
-//! element. Any argument may instead be supplied as a dynamic [`Val`]
+//! the parameter is a `list<T>` whose element type has
+//! [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid),
+//! those bytes are copied into guest memory with a single `memcpy` rather than
+//! element by element. Any argument may instead be supplied as a dynamic [`Val`]
 //! ([`ArgSpec::Val`] / [`ArgSource::Val`]), so a single call freely mixes the
 //! two representations.
 //!
@@ -65,8 +65,9 @@ pub enum ArgSpec {
     /// The argument will be supplied as a pre-encoded canonical-ABI byte image
     /// ([`ArgSource::Flat`]) and copied into guest memory in bulk.
     ///
-    /// Only valid when the parameter is a `list<T>` whose element type `T` is
-    /// [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline);
+    /// Only valid when the parameter is a `list<T>` whose element type `T` has
+    /// [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid)
+    /// (the bytes are copied in unchecked);
     /// [`Func::prepare_call`](crate::component::Func::prepare_call) returns an
     /// error otherwise.
     Flat,
@@ -288,8 +289,8 @@ impl Func {
     /// This is the dynamic-path counterpart to [`Func::typed`]: like
     /// [`Func::call`] it works without static knowledge of the component's
     /// types, but it additionally lets a `list<T>` argument whose element type
-    /// is [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline) be
-    /// provided as a borrowed slice of its canonical-ABI bytes
+    /// has [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid)
+    /// be provided as a borrowed slice of its canonical-ABI bytes
     /// ([`ArgSource::Flat`]) and copied into guest memory in bulk, avoiding the
     /// per-element `Val` allocation of [`Func::call`].
     ///
@@ -297,8 +298,8 @@ impl Func {
     ///
     /// Returns an error if `specs.len()` does not equal the number of
     /// parameters, or if an [`ArgSpec::Flat`] is paired with a parameter that is
-    /// not a `list` of a [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline)
-    /// element type.
+    /// not a `list` whose element type has
+    /// [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid).
     ///
     /// # Panics
     ///
@@ -319,11 +320,12 @@ impl Func {
             match spec {
                 ArgSpec::Val => {}
                 ArgSpec::Flat => match param {
-                    Type::List(list) if list.ty().is_cabi_inline() => {}
+                    Type::List(list) if list.ty().are_all_bit_patterns_valid() => {}
                     Type::List(_) => bail!(
-                        "argument {index}: `ArgSpec::Flat` requires a `list` whose element type \
-                         has a fixed canonical-ABI layout (no strings, lists, resources, or types \
-                         with invalid bit patterns), which this parameter's element type is not"
+                        "argument {index}: `ArgSpec::Flat` copies bytes into the guest unchecked, \
+                         so it requires a `list` whose element type has a fixed canonical-ABI \
+                         layout with no invalid bit patterns (integers, floats, and records/tuples \
+                         of them), which this parameter's element type does not"
                     ),
                     _ => bail!(
                         "argument {index}: `ArgSpec::Flat` requires a `list` parameter, but this \
@@ -422,9 +424,9 @@ impl<'a, 'b> Results<'a, 'b> {
 
     /// Read result `index` as a zero-copy view of its canonical-ABI bytes.
     ///
-    /// Only valid when the result is a `list<T>` whose element type is
-    /// [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline); the
-    /// returned slice is the list's elements laid out back-to-back exactly as
+    /// Only valid when the result is a `list<T>` whose element type has
+    /// [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid);
+    /// the returned slice is the list's elements laid out back-to-back exactly as
     /// they appear in guest memory. Returns an error for any other result type —
     /// use [`val`](Self::val) for those.
     pub fn view(&self, index: usize) -> Result<&'b [u8]> {
@@ -433,10 +435,10 @@ impl<'a, 'b> Results<'a, 'b> {
             InterfaceType::List(i) => self.cx.types[i].element,
             _ => bail!("result {index} is not a list; only list results can be viewed as bytes"),
         };
-        if !interface_type_is_cabi_inline(self.cx.types, &element) {
+        if !interface_type_all_bit_patterns_valid(self.cx.types, &element) {
             bail!(
-                "result {index} is a list whose element type is not cabi-inline; \
-                 read it with `val` instead"
+                "result {index} is a list whose element type has invalid bit patterns \
+                 (it would need validation); read it with `val` instead"
             );
         }
         // A list result is always returned indirectly (its pointer/length pair is
@@ -493,9 +495,9 @@ impl<'a, 'b> Results<'a, 'b> {
 }
 
 /// The [`InterfaceType`] counterpart of
-/// [`Type::is_cabi_inline`](crate::component::Type::is_cabi_inline), used to gate
-/// the zero-copy [`Results::view`] path. Kept in sync with that method.
-fn interface_type_is_cabi_inline(types: &ComponentTypes, ty: &InterfaceType) -> bool {
+/// [`Type::are_all_bit_patterns_valid`](crate::component::Type::are_all_bit_patterns_valid),
+/// used to gate the zero-copy [`Results::view`] path. Kept in sync with that method.
+fn interface_type_all_bit_patterns_valid(types: &ComponentTypes, ty: &InterfaceType) -> bool {
     match ty {
         InterfaceType::S8
         | InterfaceType::U8
@@ -510,11 +512,11 @@ fn interface_type_is_cabi_inline(types: &ComponentTypes, ty: &InterfaceType) -> 
         InterfaceType::Record(i) => types[*i]
             .fields
             .iter()
-            .all(|f| interface_type_is_cabi_inline(types, &f.ty)),
+            .all(|f| interface_type_all_bit_patterns_valid(types, &f.ty)),
         InterfaceType::Tuple(i) => types[*i]
             .types
             .iter()
-            .all(|t| interface_type_is_cabi_inline(types, t)),
+            .all(|t| interface_type_all_bit_patterns_valid(types, t)),
         _ => false,
     }
 }

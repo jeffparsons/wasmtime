@@ -27,10 +27,12 @@ fn flat_list_u32() -> Result<()> {
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
 
-    // The reflection gate that authorizes the fast path.
+    // The reflection gate that authorizes the fast path. `u32` is both inline
+    // and free of invalid bit patterns.
     let ty = func.ty(&store);
-    let param0 = ty.params().next().unwrap().1;
-    assert!(param0.unwrap_list().ty().is_cabi_inline());
+    let element = ty.params().next().unwrap().1.unwrap_list().ty();
+    assert!(element.is_cabi_inline());
+    assert!(element.are_all_bit_patterns_valid());
     drop(ty);
 
     let values = [32343u32, 79023439, 2084037802];
@@ -107,7 +109,7 @@ fn flat_list_record() -> Result<()> {
         .1
         .unwrap_list()
         .ty()
-        .is_cabi_inline());
+        .are_all_bit_patterns_valid());
     drop(ty);
 
     let points = [(1.0f32, 2.0f32), (3.5, -4.25), (-0.0, 100.0)];
@@ -250,20 +252,52 @@ fn flat_list_indirect_params() -> Result<()> {
     Ok(())
 }
 
-/// `prepare_call` rejects `ArgSpec::Flat` on a `list` whose element type is not
-/// cabi-inline, and on a parameter that isn't a list at all.
+/// `prepare_call` rejects `ArgSpec::Flat` on a `list` whose element type has
+/// out-of-line storage or invalid bit patterns, and on a parameter that isn't a
+/// list at all.
 #[test]
 fn flat_rejects_non_inline() -> Result<()> {
     let engine = engine();
     let mut store = Store::new(&engine, ());
 
-    // list<string>: element is not inline.
+    // list<string>: element is not inline (out-of-line storage).
     let component = Component::new(&engine, make_echo_component("(list string)", 8))?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
+    let element = func
+        .ty(&store)
+        .params()
+        .next()
+        .unwrap()
+        .1
+        .unwrap_list()
+        .ty();
+    assert!(!element.is_cabi_inline());
+    assert!(!element.are_all_bit_patterns_valid());
     let err = func.prepare_call(&store, &[ArgSpec::Flat]).unwrap_err();
     assert!(
         err.to_string().contains("fixed canonical-ABI layout"),
+        "unexpected error: {err}"
+    );
+
+    // list<bool>: the element *is* inline (fixed layout) but has invalid bit
+    // patterns, so the unchecked `Flat` path must still reject it.
+    let component = Component::new(&engine, make_echo_component("(list bool)", 8))?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+    let element = func
+        .ty(&store)
+        .params()
+        .next()
+        .unwrap()
+        .1
+        .unwrap_list()
+        .ty();
+    assert!(element.is_cabi_inline());
+    assert!(!element.are_all_bit_patterns_valid());
+    let err = func.prepare_call(&store, &[ArgSpec::Flat]).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid bit patterns"),
         "unexpected error: {err}"
     );
 

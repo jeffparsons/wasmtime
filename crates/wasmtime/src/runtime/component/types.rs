@@ -741,32 +741,28 @@ pub enum Type {
 }
 
 impl Type {
-    /// Returns whether a value of this type has a fixed canonical-ABI byte
-    /// layout that can be transferred as raw bytes with a single `memcpy`,
-    /// requiring no per-element validation.
+    /// Returns whether a value of this type is stored entirely *inline* in the
+    /// canonical ABI: it has a fixed byte layout with no out-of-line storage and
+    /// no ownership, so a `list<T>` of it is a single contiguous byte image.
     ///
-    /// This is `true` only for types with no out-of-line storage, no ownership,
-    /// and no invalid bit patterns: the signed and unsigned integers,
-    /// [`Float32`](Type::Float32), [`Float64`](Type::Float64), and
-    /// [`record`](Type::Record)s and [`tuple`](Type::Tuple)s composed
-    /// transitively of only those. Because every bit pattern of such a type is a
-    /// valid value, its canonical image can be copied verbatim without
-    /// inspecting the contents.
+    /// This is `true` for the numeric primitives, [`bool`](Type::Bool),
+    /// [`char`](Type::Char), [`enum`](Type::Enum), [`flags`](Type::Flags), and
+    /// [`record`](Type::Record)s, [`tuple`](Type::Tuple)s,
+    /// [`option`](Type::Option)s, [`result`](Type::Result)s, and
+    /// [`variant`](Type::Variant)s composed transitively of only inline types.
     ///
-    /// It is `false` for [`bool`](Type::Bool), [`char`](Type::Char),
-    /// [`enum`](Type::Enum), and [`flags`](Type::Flags) (which have invalid bit
-    /// patterns that would require validation), and for [`string`](Type::String),
-    /// [`list`](Type::List), [`option`](Type::Option), [`result`](Type::Result),
-    /// [`variant`](Type::Variant), resources, [`future`](Type::Future),
-    /// [`stream`](Type::Stream), and [`error-context`](Type::ErrorContext) (which
-    /// carry out-of-line storage, discriminants, or ownership).
+    /// It is `false` for [`string`](Type::String), [`list`](Type::List),
+    /// [`map`](Type::Map), resources ([`own`](Type::Own)/[`borrow`](Type::Borrow)),
+    /// [`future`](Type::Future), [`stream`](Type::Stream), and
+    /// [`error-context`](Type::ErrorContext), all of which carry out-of-line
+    /// storage or ownership.
     ///
-    /// This is the reflection gate that makes the bulk fast path of
-    /// [`Func::prepare_call`](crate::component::Func::prepare_call) legal: an
-    /// argument provided as pre-encoded canonical bytes
-    /// ([`ArgSource::Flat`](crate::component::ArgSource::Flat)) is accepted only
-    /// when the parameter is a `list` whose element type satisfies this
-    /// predicate.
+    /// Being inline makes a value *bulk-transferable* — its bytes can be moved
+    /// with a single `memcpy` — but does not by itself make those bytes valid
+    /// without inspection: an inline type may still have invalid bit patterns (a
+    /// `bool` other than 0/1, an out-of-range `enum` discriminant). Use
+    /// [`are_all_bit_patterns_valid`](Type::are_all_bit_patterns_valid) for the
+    /// stronger property that no validation is required.
     pub fn is_cabi_inline(&self) -> bool {
         match self {
             Type::S8
@@ -778,9 +774,66 @@ impl Type {
             | Type::S64
             | Type::U64
             | Type::Float32
-            | Type::Float64 => true,
+            | Type::Float64
+            | Type::Bool
+            | Type::Char
+            | Type::Enum(_)
+            | Type::Flags(_) => true,
             Type::Record(r) => r.fields().all(|f| f.ty.is_cabi_inline()),
             Type::Tuple(t) => t.types().all(|ty| ty.is_cabi_inline()),
+            Type::Option(o) => o.ty().is_cabi_inline(),
+            Type::Result(r) => r
+                .ok()
+                .iter()
+                .chain(r.err().iter())
+                .all(Type::is_cabi_inline),
+            Type::Variant(v) => v.cases().flat_map(|c| c.ty).all(|ty| ty.is_cabi_inline()),
+            Type::String
+            | Type::List(_)
+            | Type::Map(_)
+            | Type::Own(_)
+            | Type::Borrow(_)
+            | Type::Future(_)
+            | Type::Stream(_)
+            | Type::ErrorContext => false,
+        }
+    }
+
+    /// Returns whether *every* bit pattern of this type's canonical image is a
+    /// valid value, so its bytes can be transferred verbatim with **no
+    /// validation** at all.
+    ///
+    /// This is the stricter cousin of [`is_cabi_inline`](Type::is_cabi_inline):
+    /// it is `true` only for the signed and unsigned integers,
+    /// [`Float32`](Type::Float32), [`Float64`](Type::Float64), and
+    /// [`record`](Type::Record)s and [`tuple`](Type::Tuple)s composed
+    /// transitively of only those. Every such type is also
+    /// [`is_cabi_inline`](Type::is_cabi_inline), but the converse does not hold:
+    /// [`bool`](Type::Bool), [`char`](Type::Char), [`enum`](Type::Enum), and
+    /// [`flags`](Type::Flags) are inline yet have bit patterns that a runtime
+    /// must reject, and would therefore need a validation sweep before a bulk
+    /// transfer could be trusted.
+    ///
+    /// This is the reflection gate that makes the bulk fast path of
+    /// [`Func::prepare_call`](crate::component::Func::prepare_call) legal: an
+    /// argument provided as pre-encoded canonical bytes
+    /// ([`ArgSource::Flat`](crate::component::ArgSource::Flat)) — which are copied
+    /// into guest memory unchecked — is accepted only when the parameter is a
+    /// `list` whose element type satisfies this predicate.
+    pub fn are_all_bit_patterns_valid(&self) -> bool {
+        match self {
+            Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64 => true,
+            Type::Record(r) => r.fields().all(|f| f.ty.are_all_bit_patterns_valid()),
+            Type::Tuple(t) => t.types().all(|ty| ty.are_all_bit_patterns_valid()),
             Type::Bool
             | Type::Char
             | Type::String
