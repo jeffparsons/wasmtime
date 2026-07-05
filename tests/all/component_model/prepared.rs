@@ -481,3 +481,80 @@ fn scoped_val_tuple_with_list() -> Result<()> {
         })?;
     Ok(())
 }
+
+/// `view` rejects a guest-returned list pointer that is in-bounds but
+/// misaligned, matching the checked `Val` path (so a host `&[T]` cast is safe).
+#[test]
+fn view_rejects_misaligned_list() -> Result<()> {
+    // The guest returns a `list<u32>` whose pointer is deliberately offset by a
+    // non-multiple of 4 (but still within memory).
+    let component = format!(
+        r#"
+        (component
+            (core module $m
+                (func (export "run") (result i32)
+                    (local $base i32)
+                    (local.set $base
+                        (call $realloc (i32.const 0) (i32.const 0) (i32.const 4) (i32.const 64)))
+                    ;; result block: list pointer = base+9 (misaligned), length = 1
+                    (i32.store offset=0 (local.get $base) (i32.add (local.get $base) (i32.const 9)))
+                    (i32.store offset=4 (local.get $base) (i32.const 1))
+                    (local.get $base)
+                )
+                (memory (export "memory") 1)
+                {REALLOC_AND_FREE}
+            )
+            (core instance $i (instantiate $m))
+            (type $L (list u32))
+            (func (export "run") (result $L)
+                (canon lift
+                    (core func $i "run")
+                    (memory $i "memory")
+                    (realloc (func $i "realloc"))
+                )
+            )
+        )"#
+    );
+
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(&engine, component)?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "run").unwrap();
+
+    func.prepare_call(&store, &[])?
+        .bind()
+        .invoke_scoped(&mut store, |results| {
+            let err = results.view(0).unwrap_err();
+            assert!(err.to_string().contains("aligned"), "view: {err}");
+            // The `Val` path rejects the same misaligned pointer.
+            let err = results.val(0).unwrap_err();
+            assert!(err.to_string().contains("aligned"), "val: {err}");
+            Ok(())
+        })?;
+    Ok(())
+}
+
+/// Binding an `ArgSource` whose variant does not match the prepared `ArgSpec` is
+/// reported before the guest is entered.
+#[test]
+fn bind_wrong_source_variant_errors() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    let mut output = [Val::Bool(false)];
+    let err = func
+        .prepare_call(&store, &[ArgSpec::Flat])?
+        .bind()
+        .arg(ArgSource::Val(Val::List(vec![Val::U32(1)])))
+        .invoke(&mut store, &mut output)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not match the prepared"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}

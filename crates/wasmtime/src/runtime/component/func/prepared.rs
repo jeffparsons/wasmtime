@@ -243,6 +243,19 @@ impl<'a> BoundCall<'a> {
             );
         }
 
+        // Validate that each bound source matches its prepared spec *before*
+        // entering the guest, so a representation mismatch is a clean error
+        // rather than surfacing mid-lowering after args have been allocated.
+        for (index, (spec, source)) in specs.iter().zip(sources).enumerate() {
+            let matches = matches!(
+                (spec, source),
+                (ArgSpec::Val, ArgSource::Val(_)) | (ArgSpec::Flat, ArgSource::Flat(_))
+            );
+            if !matches {
+                bail!(spec_mismatch(index, spec));
+            }
+        }
+
         if func.abi_async(store.0) {
             unreachable!(
                 "async-lifted exports should have failed validation \
@@ -454,7 +467,15 @@ impl<'a, 'b> Results<'a, 'b> {
         let len = usize::try_from(u32::from_le_bytes(
             memory[field + 4..][..4].try_into().unwrap(),
         ))?;
-        let elt_size = usize::try_from(self.cx.types.canonical_abi(&element).size32).unwrap();
+        let abi = self.cx.types.canonical_abi(&element);
+        // Reject a misaligned list pointer, matching the `Val` lift path
+        // (`load_list`). Callers read the returned bytes as `&[T]`, so an
+        // adversarial guest returning a misaligned (but in-bounds) pointer must
+        // not be accepted here either.
+        if ptr % usize::try_from(abi.align32)? != 0 {
+            bail!("result {index}: list pointer is not aligned");
+        }
+        let elt_size = usize::try_from(abi.size32).unwrap();
         let byte_len = len
             .checked_mul(elt_size)
             .ok_or_else(|| crate::format_err!("list size overflow"))?;
@@ -555,7 +576,8 @@ fn lower_sources<T>(
                     dst.next().unwrap().write(ValRaw::i64(ptr as i64));
                     dst.next().unwrap().write(ValRaw::i64(len as i64));
                 }
-                _ => bail!(spec_mismatch(index, spec)),
+                // The source/spec pairing is validated before guest entry in `run`.
+                _ => unreachable!("argument {index} representation validated in `run`"),
             }
         }
         Ok(())
@@ -596,7 +618,8 @@ fn store_sources<T>(
                 *cx.get(field_offset + 0) = u32::try_from(list_ptr).unwrap().to_le_bytes();
                 *cx.get(field_offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
             }
-            _ => bail!(spec_mismatch(index, spec)),
+            // The source/spec pairing is validated before guest entry in `run`.
+            _ => unreachable!("argument {index} representation validated in `run`"),
         }
     }
 
