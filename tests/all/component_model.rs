@@ -22,6 +22,7 @@ mod macros;
 mod missing_async;
 mod nested;
 mod post_return;
+mod prepared;
 mod reflection;
 mod resources;
 mod strings;

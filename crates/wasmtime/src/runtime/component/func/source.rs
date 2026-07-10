@@ -15,7 +15,7 @@
 use crate::ValRaw;
 use crate::component::Val;
 use crate::component::concurrent;
-use crate::component::func::{Lower, LowerContext, desc};
+use crate::component::func::{Lower, LowerContext, ValidatedCabiBytes, desc};
 use crate::component::values::ErrorContextAny;
 use crate::prelude::*;
 use core::mem::MaybeUninit;
@@ -27,19 +27,49 @@ use wasmtime_environ::component::{
 };
 
 /// A single dynamic strategy for producing the bytes/core-values of one
-/// component value (or subtree of one).
+/// component value.
 ///
-/// This is the internal vocabulary of the dynamic lowering engine: the
-/// traversal in this module recurses through *sources*, not through [`Val`]s,
-/// so that additional strategies can be added as variants without duplicating
-/// the type-directed walk.
-pub(crate) enum ValSource<'a> {
-    /// A dynamic, owned value — the always-available strategy used by
-    /// `Func::call(&[Val])`.
+/// This is the vocabulary of the dynamic lowering engine: every dynamic way
+/// of providing an argument is a `ValSource`, and one type-directed traversal
+/// (private to this module) lowers any of them. [`Func::call`] uses the
+/// [`Val`](ValSource::Val) strategy for every argument;
+/// [`Func::prepare_call`] lets each argument choose its strategy
+/// independently, so one call freely mixes them.
+///
+/// This enum is `#[non_exhaustive]`: further strategies (per-field mixed
+/// trees, host-computed sources, …) are anticipated and will be added without
+/// a breaking change.
+///
+/// [`Func::call`]: crate::component::Func::call
+/// [`Func::prepare_call`]: crate::component::Func::prepare_call
+#[non_exhaustive]
+pub enum ValSource<'a> {
+    /// A borrowed dynamic value, lowered element by element — the
+    /// always-available strategy, compatible with every parameter type.
     Val(&'a Val),
+
+    /// A `list<T>` provided as a run of pre-validated canonical-ABI element
+    /// images, copied into guest memory with a single `memcpy`.
+    ///
+    /// The parameter must be a `list` whose element type is
+    /// [`is_cabi_inline`](crate::component::Type::is_cabi_inline) and
+    /// structurally equal to the [`ValidatedCabiBytes::ty`] the proof was
+    /// minted for. Because validation already happened at
+    /// [`ValidatedCabiBytes::checked`], lowering re-checks nothing per
+    /// element.
+    ListFlat(ValidatedCabiBytes<'a>),
 }
 
 impl ValSource<'_> {
+    /// A short human-readable description of this source's strategy, for
+    /// error messages.
+    pub(crate) fn desc(&self) -> &'static str {
+        match self {
+            ValSource::Val(val) => val.desc(),
+            ValSource::ListFlat(_) => "flat list bytes",
+        }
+    }
+
     /// Serialize this source as core Wasm stack values.
     pub(crate) fn lower<T>(
         &self,
@@ -47,7 +77,22 @@ impl ValSource<'_> {
         ty: InterfaceType,
         dst: &mut IterMut<'_, MaybeUninit<ValRaw>>,
     ) -> Result<()> {
-        let ValSource::Val(val) = self;
+        let val = match self {
+            ValSource::Val(val) => val,
+            ValSource::ListFlat(vb) => {
+                let InterfaceType::List(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide flat list bytes for {}",
+                        desc(&ty)
+                    );
+                };
+                let element = cx.types[t].element;
+                let (ptr, len) = lower_list_flat(cx, element, vb)?;
+                next_mut(dst).write(ValRaw::i64(ptr as i64));
+                next_mut(dst).write(ValRaw::i64(len as i64));
+                return Ok(());
+            }
+        };
         match (ty, val) {
             (InterfaceType::Bool, Val::Bool(value)) => {
                 value.linear_lower_to_flat(cx, ty, next_mut(dst))
@@ -219,7 +264,23 @@ impl ValSource<'_> {
     ) -> Result<()> {
         debug_assert!(offset % usize::try_from(cx.types.canonical_abi(&ty).align32)? == 0);
 
-        let ValSource::Val(val) = self;
+        let val = match self {
+            ValSource::Val(val) => val,
+            ValSource::ListFlat(vb) => {
+                let InterfaceType::List(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide flat list bytes for {}",
+                        desc(&ty)
+                    );
+                };
+                let element = cx.types[t].element;
+                let (ptr, len) = lower_list_flat(cx, element, vb)?;
+                // FIXME(#4311): needs memory64 handling
+                *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
+                *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
+                return Ok(());
+            }
+        };
         match (ty, val) {
             (InterfaceType::Bool, Val::Bool(value)) => value.linear_lower_to_memory(cx, ty, offset),
             (InterfaceType::Bool, _) => unexpected(ty, val),
@@ -525,6 +586,36 @@ impl GenericVariant<'_> {
 
         Ok(())
     }
+}
+
+/// Lower a `list<T>` from a run of pre-validated canonical element images:
+/// one guest allocation and one `memcpy`, no per-element work.
+///
+/// The caller (the public `prepare_call` surface) has already checked that
+/// the proof's element type structurally equals the parameter's element
+/// type, so the images are byte-compatible with what per-element lowering
+/// would have produced. The length re-check here is defense in depth — it
+/// makes an internal type-confusion bug a clean error instead of a
+/// mis-strided copy.
+fn lower_list_flat<T>(
+    cx: &mut LowerContext<'_, T>,
+    element_type: InterfaceType,
+    vb: &ValidatedCabiBytes<'_>,
+) -> Result<(usize, usize)> {
+    let abi = cx.types.canonical_abi(&element_type);
+    let elt_size = usize::try_from(abi.size32)?;
+    let elt_align = abi.align32;
+    let bytes = vb.bytes();
+    let count = vb.len();
+    ensure!(
+        count.checked_mul(elt_size) == Some(bytes.len()),
+        "validated buffer of {} bytes does not agree with the parameter's \
+         {elt_size}-byte element stride",
+        bytes.len(),
+    );
+    let ptr = cx.realloc(0, 0, elt_align, bytes.len())?;
+    cx.as_slice_mut()[ptr..][..bytes.len()].copy_from_slice(bytes);
+    Ok((ptr, count))
 }
 
 /// Lower a list with the specified element type and values.

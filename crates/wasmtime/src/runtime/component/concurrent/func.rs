@@ -1,6 +1,6 @@
 use crate::component::concurrent::TaskId;
 use crate::component::concurrent::{self, GuestTaskId, PreparedCall};
-use crate::component::func::LowerContext;
+use crate::component::func::{LowerContext, ValSource};
 use crate::component::{AsAccessor, ComponentNamedList, Func, Lift, Lower, TypedFunc, Val};
 use crate::prelude::*;
 use crate::runtime::vm::SendSyncPtr;
@@ -179,7 +179,8 @@ impl Func {
             false,
             move |func, store, params_out| {
                 func.with_lower_context(store, |cx, ty| {
-                    Self::lower_args(cx, &params, ty, params_out)
+                    let sources: Vec<ValSource<'_>> = params.iter().map(ValSource::Val).collect();
+                    Self::lower_args(cx, &sources, ty, params_out)
                 })
             },
             move |func, store, results| {

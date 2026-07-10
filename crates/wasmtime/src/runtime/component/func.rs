@@ -17,12 +17,14 @@ use wasmtime_environ::component::{
 
 mod host;
 mod options;
+mod prepared;
 mod source;
 mod typed;
 mod validated;
 pub use self::host::*;
 pub use self::options::*;
-pub(crate) use self::source::ValSource;
+pub use self::prepared::{BoundCall, PreparedCall, ValSpec};
+pub use self::source::ValSource;
 pub use self::typed::*;
 pub use self::validated::{ValidatedCabiBytes, ValidatedCabiBytesBuf};
 
@@ -348,7 +350,8 @@ impl Func {
                     // `MaybeUninit<array-of-maybe-uninit>` is initialized because
                     // each individual element is still considered uninitialized.
                     let dst: &mut [MaybeUninit<ValRaw>] = dst.assume_init_mut();
-                    Self::lower_args(cx, params, ty, dst)
+                    let sources: Vec<ValSource<'_>> = params.iter().map(ValSource::Val).collect();
+                    Self::lower_args(cx, &sources, ty, dst)
                 },
                 |cx, results_ty, src: &[ValRaw; MAX_FLAT_RESULTS]| {
                     let max_flat = MAX_FLAT_RESULTS;
@@ -570,7 +573,7 @@ impl Func {
 
     pub(crate) fn lower_args<T>(
         cx: &mut LowerContext<'_, T>,
-        params: &[Val],
+        params: &[ValSource<'_>],
         params_ty: InterfaceType,
         dst: &mut [MaybeUninit<ValRaw>],
     ) -> Result<()> {
@@ -584,7 +587,7 @@ impl Func {
             params
                 .iter()
                 .zip(params_ty.types.iter())
-                .try_for_each(|(param, ty)| ValSource::Val(param).lower(cx, *ty, dst))
+                .try_for_each(|(param, ty)| param.lower(cx, *ty, dst))
         } else {
             Self::store_args(cx, &params_ty, params, dst)
         }
@@ -593,7 +596,7 @@ impl Func {
     fn store_args<T>(
         cx: &mut LowerContext<'_, T>,
         params_ty: &TypeTuple,
-        args: &[Val],
+        args: &[ValSource<'_>],
         dst: &mut [MaybeUninit<ValRaw>],
     ) -> Result<()> {
         let size = usize::try_from(params_ty.abi.size32).unwrap();
@@ -601,7 +604,7 @@ impl Func {
         let mut offset = ptr;
         for (ty, arg) in params_ty.types.iter().zip(args) {
             let abi = cx.types.canonical_abi(ty);
-            ValSource::Val(arg).store(cx, *ty, abi.next_field32_size(&mut offset))?;
+            arg.store(cx, *ty, abi.next_field32_size(&mut offset))?;
         }
 
         dst[0].write(ValRaw::i64(ptr as i64));
