@@ -105,6 +105,16 @@ impl<'a> ValidatedCabiBytes<'a> {
         self.bytes
     }
 
+    /// Copy these bytes into an owning [`ValidatedCabiBytesBuf`], carrying
+    /// the proof across without re-validating.
+    pub fn to_owned(&self) -> ValidatedCabiBytesBuf {
+        ValidatedCabiBytesBuf {
+            bytes: self.bytes.to_vec(),
+            ty: self.ty.clone(),
+            elems: self.elems,
+        }
+    }
+
     /// The component-model type these bytes are images of.
     pub fn ty(&self) -> &Type {
         &self.ty

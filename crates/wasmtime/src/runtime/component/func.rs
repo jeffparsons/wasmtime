@@ -23,7 +23,7 @@ mod typed;
 mod validated;
 pub use self::host::*;
 pub use self::options::*;
-pub use self::prepared::{BoundCall, PreparedCall, ValSpec};
+pub use self::prepared::{BoundCall, PreparedCall, Results, ValSpec};
 pub use self::source::ValSource;
 pub use self::typed::*;
 pub use self::validated::{ValidatedCabiBytes, ValidatedCabiBytesBuf};
