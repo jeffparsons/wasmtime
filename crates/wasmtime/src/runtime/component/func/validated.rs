@@ -295,7 +295,7 @@ pub(crate) fn validate_image(
                 FlagsSize::Size0 => {}
                 FlagsSize::Size1 => {
                     let bits = image[0];
-                    let mask = mask_u32(count) as u8;
+                    let mask = u8::try_from(mask_u32(count)).unwrap();
                     ensure!(
                         bits & !mask == 0,
                         "flags value 0x{bits:02x} has unknown bits"
@@ -303,7 +303,7 @@ pub(crate) fn validate_image(
                 }
                 FlagsSize::Size2 => {
                     let bits = u16::from_le_bytes(image[..2].try_into().unwrap());
-                    let mask = mask_u32(count) as u16;
+                    let mask = u16::try_from(mask_u32(count)).unwrap();
                     ensure!(
                         bits & !mask == 0,
                         "flags value 0x{bits:04x} has unknown bits"
