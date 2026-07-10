@@ -1,14 +1,13 @@
 use crate::ValRaw;
 use crate::component::ResourceAny;
-use crate::component::concurrent::{self, ErrorContext, FutureAny, StreamAny};
-use crate::component::func::{Lift, LiftContext, Lower, LowerContext, desc};
+use crate::component::concurrent::{ErrorContext, FutureAny, StreamAny};
+use crate::component::func::{Lift, LiftContext, LowerContext, ValSource};
 use crate::prelude::*;
 use core::mem::MaybeUninit;
 use core::slice::{Iter, IterMut};
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 use wasmtime_environ::component::{
-    CanonicalAbiInfo, InterfaceType, TypeEnum, TypeFlags, TypeListIndex, TypeMap, TypeMapIndex,
-    TypeOption, TypeResult, TypeVariant, VariantInfo,
+    InterfaceType, TypeFlags, TypeListIndex, TypeMapIndex, VariantInfo,
 };
 
 /// Represents possible runtime values which a component function can either
@@ -384,346 +383,30 @@ impl Val {
     }
 
     /// Serialize this value as core Wasm stack values.
+    ///
+    /// This is a thin shim over the dynamic lowering driver: a [`Val`] is one
+    /// kind of [`ValSource`], and the recursive type-directed traversal lives
+    /// with the driver in `func::source`.
     pub(crate) fn lower<T>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
         dst: &mut IterMut<'_, MaybeUninit<ValRaw>>,
     ) -> Result<()> {
-        match (ty, self) {
-            (InterfaceType::Bool, Val::Bool(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Bool, _) => unexpected(ty, self),
-            (InterfaceType::S8, Val::S8(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::S8, _) => unexpected(ty, self),
-            (InterfaceType::U8, Val::U8(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::U8, _) => unexpected(ty, self),
-            (InterfaceType::S16, Val::S16(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::S16, _) => unexpected(ty, self),
-            (InterfaceType::U16, Val::U16(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::U16, _) => unexpected(ty, self),
-            (InterfaceType::S32, Val::S32(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::S32, _) => unexpected(ty, self),
-            (InterfaceType::U32, Val::U32(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::U32, _) => unexpected(ty, self),
-            (InterfaceType::S64, Val::S64(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::S64, _) => unexpected(ty, self),
-            (InterfaceType::U64, Val::U64(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::U64, _) => unexpected(ty, self),
-            (InterfaceType::Float32, Val::Float32(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Float32, _) => unexpected(ty, self),
-            (InterfaceType::Float64, Val::Float64(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Float64, _) => unexpected(ty, self),
-            (InterfaceType::Char, Val::Char(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Char, _) => unexpected(ty, self),
-            // NB: `lower` on `ResourceAny` does its own type-checking, so skip
-            // looking at it here.
-            (InterfaceType::Borrow(_) | InterfaceType::Own(_), Val::Resource(value)) => {
-                value.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Borrow(_) | InterfaceType::Own(_), _) => unexpected(ty, self),
-            (InterfaceType::String, Val::String(value)) => {
-                let my_dst = &mut MaybeUninit::<[ValRaw; 2]>::uninit();
-                value.linear_lower_to_flat(cx, ty, my_dst)?;
-                let my_dst = unsafe { my_dst.assume_init() };
-                next_mut(dst).write(my_dst[0]);
-                next_mut(dst).write(my_dst[1]);
-                Ok(())
-            }
-            (InterfaceType::String, _) => unexpected(ty, self),
-            (InterfaceType::List(ty), Val::List(values)) => {
-                let ty = &cx.types[ty];
-                let (ptr, len) = lower_list(cx, ty.element, values)?;
-                next_mut(dst).write(ValRaw::i64(ptr as i64));
-                next_mut(dst).write(ValRaw::i64(len as i64));
-                Ok(())
-            }
-            (InterfaceType::List(_), _) => unexpected(ty, self),
-            (InterfaceType::Map(ty), Val::Map(pairs)) => {
-                let map_ty = &cx.types[ty];
-                let (ptr, len) = lower_map(cx, map_ty, pairs)?;
-                next_mut(dst).write(ValRaw::i64(ptr as i64));
-                next_mut(dst).write(ValRaw::i64(len as i64));
-                Ok(())
-            }
-            (InterfaceType::Map(_), _) => unexpected(ty, self),
-            (InterfaceType::Record(ty), Val::Record(values)) => {
-                let ty = &cx.types[ty];
-                if ty.fields.len() != values.len() {
-                    bail!("expected {} fields, got {}", ty.fields.len(), values.len());
-                }
-                for ((name, value), field) in values.iter().zip(ty.fields.iter()) {
-                    if *name != field.name {
-                        bail!("expected field `{}`, got `{name}`", field.name);
-                    }
-                    value.lower(cx, field.ty, dst)?;
-                }
-                Ok(())
-            }
-            (InterfaceType::Record(_), _) => unexpected(ty, self),
-            (InterfaceType::Tuple(ty), Val::Tuple(values)) => {
-                let ty = &cx.types[ty];
-                if ty.types.len() != values.len() {
-                    bail!("expected {} types, got {}", ty.types.len(), values.len());
-                }
-                for (value, ty) in values.iter().zip(ty.types.iter()) {
-                    value.lower(cx, *ty, dst)?;
-                }
-                Ok(())
-            }
-            (InterfaceType::Tuple(_), _) => unexpected(ty, self),
-            (InterfaceType::Variant(ty), Val::Variant(n, v)) => {
-                GenericVariant::variant(&cx.types[ty], n, v)?.lower(cx, dst)
-            }
-            (InterfaceType::Variant(_), _) => unexpected(ty, self),
-            (InterfaceType::Option(ty), Val::Option(v)) => {
-                GenericVariant::option(&cx.types[ty], v).lower(cx, dst)
-            }
-            (InterfaceType::Option(_), _) => unexpected(ty, self),
-            (InterfaceType::Result(ty), Val::Result(v)) => {
-                GenericVariant::result(&cx.types[ty], v)?.lower(cx, dst)
-            }
-            (InterfaceType::Result(_), _) => unexpected(ty, self),
-            (InterfaceType::Enum(ty), Val::Enum(discriminant)) => {
-                let discriminant = get_enum_discriminant(&cx.types[ty], discriminant)?;
-                next_mut(dst).write(ValRaw::u32(discriminant));
-                Ok(())
-            }
-            (InterfaceType::Enum(_), _) => unexpected(ty, self),
-            (InterfaceType::Flags(ty), Val::Flags(value)) => {
-                let ty = &cx.types[ty];
-                let storage = flags_to_storage(ty, value)?;
-                for value in storage {
-                    next_mut(dst).write(ValRaw::u32(value));
-                }
-                Ok(())
-            }
-            (InterfaceType::Flags(_), _) => unexpected(ty, self),
-            (InterfaceType::Future(_), Val::Future(f)) => {
-                f.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Future(_), _) => unexpected(ty, self),
-            (InterfaceType::Stream(_), Val::Stream(s)) => {
-                s.linear_lower_to_flat(cx, ty, next_mut(dst))
-            }
-            (InterfaceType::Stream(_), _) => unexpected(ty, self),
-            (InterfaceType::ErrorContext(_), Val::ErrorContext(ErrorContextAny(rep))) => {
-                concurrent::lower_error_context_to_index(*rep, cx, ty)?.linear_lower_to_flat(
-                    cx,
-                    InterfaceType::U32,
-                    next_mut(dst),
-                )
-            }
-            (InterfaceType::ErrorContext(_), _) => unexpected(ty, self),
-            (InterfaceType::FixedLengthList(ty), Val::FixedLengthList(values)) => {
-                let ty = &cx.types[ty];
-                if ty.size as usize != values.len() {
-                    bail!("expected vec of size {}, got {}", ty.size, values.len());
-                }
-                for value in values {
-                    value.lower(cx, ty.element, dst)?;
-                }
-                Ok(())
-            }
-            (InterfaceType::FixedLengthList(_), _) => unexpected(ty, self),
-        }
+        ValSource::Val(self).lower(cx, ty, dst)
     }
 
     /// Serialize this value to the heap at the specified memory location.
+    ///
+    /// As with [`Val::lower`] this is a shim over the dynamic lowering driver
+    /// in `func::source`.
     pub(crate) fn store<T>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
         offset: usize,
     ) -> Result<()> {
-        debug_assert!(offset % usize::try_from(cx.types.canonical_abi(&ty).align32)? == 0);
-
-        match (ty, self) {
-            (InterfaceType::Bool, Val::Bool(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::Bool, _) => unexpected(ty, self),
-            (InterfaceType::U8, Val::U8(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::U8, _) => unexpected(ty, self),
-            (InterfaceType::S8, Val::S8(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::S8, _) => unexpected(ty, self),
-            (InterfaceType::U16, Val::U16(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::U16, _) => unexpected(ty, self),
-            (InterfaceType::S16, Val::S16(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::S16, _) => unexpected(ty, self),
-            (InterfaceType::U32, Val::U32(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::U32, _) => unexpected(ty, self),
-            (InterfaceType::S32, Val::S32(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::S32, _) => unexpected(ty, self),
-            (InterfaceType::U64, Val::U64(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::U64, _) => unexpected(ty, self),
-            (InterfaceType::S64, Val::S64(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::S64, _) => unexpected(ty, self),
-            (InterfaceType::Float32, Val::Float32(value)) => {
-                value.linear_lower_to_memory(cx, ty, offset)
-            }
-            (InterfaceType::Float32, _) => unexpected(ty, self),
-            (InterfaceType::Float64, Val::Float64(value)) => {
-                value.linear_lower_to_memory(cx, ty, offset)
-            }
-            (InterfaceType::Float64, _) => unexpected(ty, self),
-            (InterfaceType::Char, Val::Char(value)) => value.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::Char, _) => unexpected(ty, self),
-            (InterfaceType::String, Val::String(value)) => {
-                value.linear_lower_to_memory(cx, ty, offset)
-            }
-            (InterfaceType::String, _) => unexpected(ty, self),
-
-            // NB: resources do type-checking when they lower.
-            (InterfaceType::Borrow(_) | InterfaceType::Own(_), Val::Resource(value)) => {
-                value.linear_lower_to_memory(cx, ty, offset)
-            }
-            (InterfaceType::Borrow(_) | InterfaceType::Own(_), _) => unexpected(ty, self),
-            (InterfaceType::List(ty), Val::List(values)) => {
-                let ty = &cx.types[ty];
-                let (ptr, len) = lower_list(cx, ty.element, values)?;
-                // FIXME(#4311): needs memory64 handling
-                *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
-                *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
-                Ok(())
-            }
-            (InterfaceType::List(_), _) => unexpected(ty, self),
-            (InterfaceType::Map(ty_idx), Val::Map(values)) => {
-                let map_ty = &cx.types[ty_idx];
-                let (ptr, len) = lower_map(cx, map_ty, values)?;
-                // FIXME(#4311): needs memory64 handling
-                *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
-                *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
-                Ok(())
-            }
-            (InterfaceType::Map(_), _) => unexpected(ty, self),
-            (InterfaceType::Record(ty), Val::Record(values)) => {
-                let ty = &cx.types[ty];
-                if ty.fields.len() != values.len() {
-                    bail!("expected {} fields, got {}", ty.fields.len(), values.len());
-                }
-                let mut offset = offset;
-                for ((name, value), field) in values.iter().zip(ty.fields.iter()) {
-                    if *name != field.name {
-                        bail!("expected field `{}`, got `{name}`", field.name);
-                    }
-                    value.store(
-                        cx,
-                        field.ty,
-                        cx.types
-                            .canonical_abi(&field.ty)
-                            .next_field32_size(&mut offset),
-                    )?;
-                }
-                Ok(())
-            }
-            (InterfaceType::Record(_), _) => unexpected(ty, self),
-            (InterfaceType::Tuple(ty), Val::Tuple(values)) => {
-                let ty = &cx.types[ty];
-                if ty.types.len() != values.len() {
-                    bail!("expected {} types, got {}", ty.types.len(), values.len());
-                }
-                let mut offset = offset;
-                for (value, ty) in values.iter().zip(ty.types.iter()) {
-                    value.store(
-                        cx,
-                        *ty,
-                        cx.types.canonical_abi(ty).next_field32_size(&mut offset),
-                    )?;
-                }
-                Ok(())
-            }
-            (InterfaceType::Tuple(_), _) => unexpected(ty, self),
-
-            (InterfaceType::Variant(ty), Val::Variant(n, v)) => {
-                GenericVariant::variant(&cx.types[ty], n, v)?.store(cx, offset)
-            }
-            (InterfaceType::Variant(_), _) => unexpected(ty, self),
-            (InterfaceType::Enum(ty), Val::Enum(v)) => {
-                GenericVariant::enum_(&cx.types[ty], v)?.store(cx, offset)
-            }
-            (InterfaceType::Enum(_), _) => unexpected(ty, self),
-            (InterfaceType::Option(ty), Val::Option(v)) => {
-                GenericVariant::option(&cx.types[ty], v).store(cx, offset)
-            }
-            (InterfaceType::Option(_), _) => unexpected(ty, self),
-            (InterfaceType::Result(ty), Val::Result(v)) => {
-                GenericVariant::result(&cx.types[ty], v)?.store(cx, offset)
-            }
-            (InterfaceType::Result(_), _) => unexpected(ty, self),
-
-            (InterfaceType::Flags(ty), Val::Flags(flags)) => {
-                let ty = &cx.types[ty];
-                let storage = flags_to_storage(ty, flags)?;
-                match FlagsSize::from_count(ty.names.len()) {
-                    FlagsSize::Size0 => {}
-                    FlagsSize::Size1 => u8::try_from(storage[0]).unwrap().linear_lower_to_memory(
-                        cx,
-                        InterfaceType::U8,
-                        offset,
-                    )?,
-                    FlagsSize::Size2 => u16::try_from(storage[0]).unwrap().linear_lower_to_memory(
-                        cx,
-                        InterfaceType::U16,
-                        offset,
-                    )?,
-                    FlagsSize::Size4Plus(_) => {
-                        let mut offset = offset;
-                        for value in storage {
-                            value.linear_lower_to_memory(cx, InterfaceType::U32, offset)?;
-                            offset += 4;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            (InterfaceType::Flags(_), _) => unexpected(ty, self),
-            (InterfaceType::Future(_), Val::Future(f)) => f.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::Future(_), _) => unexpected(ty, self),
-            (InterfaceType::Stream(_), Val::Stream(s)) => s.linear_lower_to_memory(cx, ty, offset),
-            (InterfaceType::Stream(_), _) => unexpected(ty, self),
-            (InterfaceType::ErrorContext(_), Val::ErrorContext(ErrorContextAny(rep))) => {
-                concurrent::lower_error_context_to_index(*rep, cx, ty)?.linear_lower_to_memory(
-                    cx,
-                    InterfaceType::U32,
-                    offset,
-                )
-            }
-            (InterfaceType::ErrorContext(_), _) => unexpected(ty, self),
-            (InterfaceType::FixedLengthList(ty), Val::FixedLengthList(values)) => {
-                let ty = &cx.types[ty];
-                if ty.size as usize != values.len() {
-                    bail!("expected {} types, got {}", ty.size, values.len());
-                }
-                let elemsize = cx.types.canonical_abi(&ty.element).size32 as usize;
-                for (n, value) in values.iter().enumerate() {
-                    value.store(cx, ty.element, elemsize * n)?;
-                }
-                Ok(())
-            }
-            (InterfaceType::FixedLengthList(_), _) => unexpected(ty, self),
-        }
+        ValSource::Val(self).store(cx, ty, offset)
     }
 
     pub(crate) fn desc(&self) -> &'static str {
@@ -848,147 +531,6 @@ impl PartialEq for Val {
 }
 
 impl Eq for Val {}
-
-struct GenericVariant<'a> {
-    discriminant: u32,
-    payload: Option<(&'a Val, InterfaceType)>,
-    abi: &'a CanonicalAbiInfo,
-    info: &'a VariantInfo,
-}
-
-impl GenericVariant<'_> {
-    fn result<'a>(
-        ty: &'a TypeResult,
-        r: &'a Result<Option<Box<Val>>, Option<Box<Val>>>,
-    ) -> Result<GenericVariant<'a>> {
-        let (discriminant, payload) = match r {
-            Ok(val) => {
-                let payload = match (val, ty.ok) {
-                    (Some(val), Some(ty)) => Some((&**val, ty)),
-                    (None, None) => None,
-                    (Some(_), None) => {
-                        bail!("payload provided to `ok` but not expected");
-                    }
-                    (None, Some(_)) => {
-                        bail!("payload expected to `ok` but not provided");
-                    }
-                };
-                (0, payload)
-            }
-            Err(val) => {
-                let payload = match (val, ty.err) {
-                    (Some(val), Some(ty)) => Some((&**val, ty)),
-                    (None, None) => None,
-                    (Some(_), None) => {
-                        bail!("payload provided to `err` but not expected");
-                    }
-                    (None, Some(_)) => {
-                        bail!("payload expected to `err` but not provided");
-                    }
-                };
-                (1, payload)
-            }
-        };
-        Ok(GenericVariant {
-            discriminant,
-            payload,
-            abi: &ty.abi,
-            info: &ty.info,
-        })
-    }
-
-    fn option<'a>(ty: &'a TypeOption, r: &'a Option<Box<Val>>) -> GenericVariant<'a> {
-        let (discriminant, payload) = match r {
-            None => (0, None),
-            Some(val) => (1, Some((&**val, ty.ty))),
-        };
-        GenericVariant {
-            discriminant,
-            payload,
-            abi: &ty.abi,
-            info: &ty.info,
-        }
-    }
-
-    fn enum_<'a>(ty: &'a TypeEnum, discriminant: &str) -> Result<GenericVariant<'a>> {
-        let discriminant = get_enum_discriminant(ty, discriminant)?;
-
-        Ok(GenericVariant {
-            discriminant,
-            payload: None,
-            abi: &ty.abi,
-            info: &ty.info,
-        })
-    }
-
-    fn variant<'a>(
-        ty: &'a TypeVariant,
-        discriminant_name: &str,
-        payload: &'a Option<Box<Val>>,
-    ) -> Result<GenericVariant<'a>> {
-        let (discriminant, payload_ty) = get_variant_discriminant(ty, discriminant_name)?;
-
-        let payload = match (payload, payload_ty) {
-            (Some(val), Some(ty)) => Some((&**val, *ty)),
-            (None, None) => None,
-            (Some(_), None) => bail!("did not expect a payload for case `{discriminant_name}`"),
-            (None, Some(_)) => bail!("expected a payload for case `{discriminant_name}`"),
-        };
-
-        Ok(GenericVariant {
-            discriminant,
-            payload,
-            abi: &ty.abi,
-            info: &ty.info,
-        })
-    }
-
-    fn lower<T>(
-        &self,
-        cx: &mut LowerContext<'_, T>,
-        dst: &mut IterMut<'_, MaybeUninit<ValRaw>>,
-    ) -> Result<()> {
-        next_mut(dst).write(ValRaw::u32(self.discriminant));
-
-        // For the remaining lowered representation of this variant that
-        // the payload didn't write we write out zeros here to ensure
-        // the entire variant is written.
-        let value_flat = match self.payload {
-            Some((value, ty)) => {
-                value.lower(cx, ty, dst)?;
-                cx.types.canonical_abi(&ty).flat_count(usize::MAX).unwrap()
-            }
-            None => 0,
-        };
-        let variant_flat = self.abi.flat_count(usize::MAX).unwrap();
-        for _ in (1 + value_flat)..variant_flat {
-            next_mut(dst).write(ValRaw::u64(0));
-        }
-        Ok(())
-    }
-
-    fn store<T>(&self, cx: &mut LowerContext<'_, T>, offset: usize) -> Result<()> {
-        match self.info.size {
-            DiscriminantSize::Size1 => u8::try_from(self.discriminant)
-                .unwrap()
-                .linear_lower_to_memory(cx, InterfaceType::U8, offset)?,
-            DiscriminantSize::Size2 => u16::try_from(self.discriminant)
-                .unwrap()
-                .linear_lower_to_memory(cx, InterfaceType::U16, offset)?,
-            DiscriminantSize::Size4 => {
-                self.discriminant
-                    .linear_lower_to_memory(cx, InterfaceType::U32, offset)?
-            }
-        }
-
-        if let Some((value, ty)) = self.payload {
-            let offset = offset + usize::try_from(self.info.payload_offset32).unwrap();
-            value.store(cx, ty, offset)?;
-        }
-
-        Ok(())
-    }
-}
 
 fn lift_flat_pointer_pair(
     cx: &mut LiftContext<'_>,
@@ -1143,58 +685,6 @@ fn lift_variant(
     Ok((discriminant, value))
 }
 
-/// Lower a list with the specified element type and values.
-fn lower_list<T>(
-    cx: &mut LowerContext<'_, T>,
-    element_type: InterfaceType,
-    items: &[Val],
-) -> Result<(usize, usize)> {
-    let abi = cx.types.canonical_abi(&element_type);
-    let elt_size = usize::try_from(abi.size32)?;
-    let elt_align = abi.align32;
-    let size = items
-        .len()
-        .checked_mul(elt_size)
-        .ok_or_else(|| crate::format_err!("size overflow copying a list"))?;
-    let ptr = cx.realloc(0, 0, elt_align, size)?;
-    let mut element_ptr = ptr;
-    for item in items {
-        item.store(cx, element_type, element_ptr)?;
-        element_ptr += elt_size;
-    }
-    Ok((ptr, items.len()))
-}
-
-/// Lower a map as list<tuple<k, v>> with the specified key and value types.
-fn lower_map<T>(
-    cx: &mut LowerContext<'_, T>,
-    map_ty: &TypeMap,
-    pairs: &[(Val, Val)],
-) -> Result<(usize, usize)> {
-    let key_type = map_ty.key;
-    let value_type = map_ty.value;
-    let value_offset = usize::try_from(map_ty.value_offset32).unwrap();
-    let tuple_align = map_ty.entry_abi.align32;
-    let tuple_size = usize::try_from(map_ty.entry_abi.size32).unwrap();
-
-    let size = pairs
-        .len()
-        .checked_mul(tuple_size)
-        .ok_or_else(|| crate::format_err!("size overflow copying a map"))?;
-    let ptr = cx.realloc(0, 0, tuple_align, size)?;
-
-    let mut tuple_ptr = ptr;
-    for (key, value) in pairs {
-        // Store key at tuple_ptr
-        key.store(cx, key_type, tuple_ptr)?;
-        // Store value at tuple_ptr + value_offset (properly aligned)
-        value.store(cx, value_type, tuple_ptr + value_offset)?;
-        tuple_ptr += tuple_size;
-    }
-
-    Ok((ptr, pairs.len()))
-}
-
 fn push_flags(ty: &TypeFlags, flags: &mut Vec<String>, mut offset: u32, mut bits: u32) {
     while bits > 0 && usize::try_from(offset).unwrap() < ty.names.len() {
         if bits & 1 != 0 {
@@ -1205,56 +695,8 @@ fn push_flags(ty: &TypeFlags, flags: &mut Vec<String>, mut offset: u32, mut bits
     }
 }
 
-fn flags_to_storage(ty: &TypeFlags, flags: &[String]) -> Result<Vec<u32>> {
-    let mut storage = match FlagsSize::from_count(ty.names.len()) {
-        FlagsSize::Size0 => Vec::new(),
-        FlagsSize::Size1 | FlagsSize::Size2 => vec![0],
-        FlagsSize::Size4Plus(n) => vec![0; n.into()],
-    };
-
-    for flag in flags {
-        let bit = ty
-            .names
-            .get_index_of(flag)
-            .ok_or_else(|| crate::format_err!("unknown flag: `{flag}`"))?;
-        storage[bit / 32] |= 1 << (bit % 32);
-    }
-    Ok(storage)
-}
-
-fn get_enum_discriminant(ty: &TypeEnum, n: &str) -> Result<u32> {
-    ty.names
-        .get_index_of(n)
-        .ok_or_else(|| crate::format_err!("enum variant name `{n}` is not valid"))
-        .map(|i| i.try_into().unwrap())
-}
-
-fn get_variant_discriminant<'a>(
-    ty: &'a TypeVariant,
-    name: &str,
-) -> Result<(u32, &'a Option<InterfaceType>)> {
-    let (i, _, ty) = ty
-        .cases
-        .get_full(name)
-        .ok_or_else(|| crate::format_err!("unknown variant case: `{name}`"))?;
-    Ok((i.try_into().unwrap(), ty))
-}
-
 fn next<'a>(src: &mut Iter<'a, ValRaw>) -> &'a ValRaw {
     src.next().unwrap()
-}
-
-fn next_mut<'a>(dst: &mut IterMut<'a, MaybeUninit<ValRaw>>) -> &'a mut MaybeUninit<ValRaw> {
-    dst.next().unwrap()
-}
-
-#[cold]
-fn unexpected<T>(ty: InterfaceType, val: &Val) -> Result<T> {
-    bail!(
-        "type mismatch: expected {}, found {}",
-        desc(&ty),
-        val.desc()
-    )
 }
 
 /// Represents a component model `error-context`.

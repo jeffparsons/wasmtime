@@ -17,9 +17,11 @@ use wasmtime_environ::component::{
 
 mod host;
 mod options;
+mod source;
 mod typed;
 pub use self::host::*;
 pub use self::options::*;
+pub(crate) use self::source::ValSource;
 pub use self::typed::*;
 
 /// A WebAssembly component function which can be called.
@@ -580,7 +582,7 @@ impl Func {
             params
                 .iter()
                 .zip(params_ty.types.iter())
-                .try_for_each(|(param, ty)| param.lower(cx, *ty, dst))
+                .try_for_each(|(param, ty)| ValSource::Val(param).lower(cx, *ty, dst))
         } else {
             Self::store_args(cx, &params_ty, params, dst)
         }
@@ -597,7 +599,7 @@ impl Func {
         let mut offset = ptr;
         for (ty, arg) in params_ty.types.iter().zip(args) {
             let abi = cx.types.canonical_abi(ty);
-            arg.store(cx, *ty, abi.next_field32_size(&mut offset))?;
+            ValSource::Val(arg).store(cx, *ty, abi.next_field32_size(&mut offset))?;
         }
 
         dst[0].write(ValRaw::i64(ptr as i64));
