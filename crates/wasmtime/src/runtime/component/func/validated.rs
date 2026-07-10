@@ -40,9 +40,23 @@ use wasmtime_environ::component::{CanonicalAbiInfo, ComponentTypes, InterfaceTyp
 
 /// A borrowed run of canonical-ABI byte images, validated at construction.
 ///
-/// See the [module documentation](self) for the proof-carrying semantics.
-/// The run holds `len()` contiguous images of `ty()`; a single value is a
-/// run of length 1.
+/// Holding one of these is unforgeable proof that the wrapped bytes are a
+/// contiguous run of `len()` valid canonical-ABI images of `ty()` (a single
+/// value is a run of length 1) — bytes indistinguishable from what
+/// Wasmtime's own lowering of equivalent values would have produced — so
+/// they may be copied into a guest's memory as-is, with no further
+/// inspection. Validation happens exactly once, in
+/// [`checked`](ValidatedCabiBytes::checked): O(1) for
+/// [`are_all_bit_patterns_valid`](Type::are_all_bit_patterns_valid) types, a
+/// linear sweep for other [`is_cabi_inline`](Type::is_cabi_inline) types,
+/// and an outright rejection for non-inline types.
+///
+/// Two deliberate limits of the "valid" claim, matching what lowering
+/// itself produces: padding bytes are not examined (lowering never writes
+/// them), and float NaN payloads are not canonicalized (the dynamic `Val`
+/// path also copies float bits verbatim). Validation is *stricter* than
+/// lifting for `bool`: lifting tolerates any nonzero byte as `true`, but
+/// lowering only ever produces 0 or 1, so only those are accepted.
 pub struct ValidatedCabiBytes<'a> {
     bytes: &'a [u8],
     ty: Type,
