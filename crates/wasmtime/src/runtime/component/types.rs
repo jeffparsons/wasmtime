@@ -787,6 +787,129 @@ pub enum Type {
 }
 
 impl Type {
+    /// Returns whether a value of this type is stored entirely *inline* in its
+    /// canonical-ABI representation: a fixed byte layout with no out-of-line
+    /// storage (no `string`s or `list`s, whose bytes live elsewhere in linear
+    /// memory) and no ownership (no resource handles, futures, streams, or
+    /// error-contexts, which are entries in per-instance tables rather than
+    /// plain bytes).
+    ///
+    /// Being inline makes a value *bulk-transferable* — its canonical bytes
+    /// can be moved with a single `memcpy` — but does not by itself make an
+    /// arbitrary byte image *valid* without inspection: an inline type may
+    /// still have invalid bit patterns (a `bool` other than 0 or 1, an
+    /// out-of-range `enum` discriminant). Use
+    /// [`are_all_bit_patterns_valid`](Type::are_all_bit_patterns_valid) for
+    /// the stronger property that no validation is required.
+    pub fn is_cabi_inline(&self) -> bool {
+        match self {
+            Type::Bool
+            | Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64
+            | Type::Char
+            | Type::Enum(_)
+            | Type::Flags(_) => true,
+            // Composite types defer to the shared recursive predicate over
+            // the internal type tables (one implementation, used both here
+            // and by the internal lowering machinery).
+            Type::Record(h) => {
+                interface_type_is_cabi_inline(&h.0.types, &InterfaceType::Record(h.0.index))
+            }
+            Type::Tuple(h) => {
+                interface_type_is_cabi_inline(&h.0.types, &InterfaceType::Tuple(h.0.index))
+            }
+            Type::Variant(h) => {
+                interface_type_is_cabi_inline(&h.0.types, &InterfaceType::Variant(h.0.index))
+            }
+            Type::Option(h) => {
+                interface_type_is_cabi_inline(&h.0.types, &InterfaceType::Option(h.0.index))
+            }
+            Type::Result(h) => {
+                interface_type_is_cabi_inline(&h.0.types, &InterfaceType::Result(h.0.index))
+            }
+            Type::FixedLengthList(h) => interface_type_is_cabi_inline(
+                &h.0.types,
+                &InterfaceType::FixedLengthList(h.0.index),
+            ),
+            Type::String
+            | Type::List(_)
+            | Type::Map(_)
+            | Type::Own(_)
+            | Type::Borrow(_)
+            | Type::Future(_)
+            | Type::Stream(_)
+            | Type::ErrorContext => false,
+        }
+    }
+
+    /// Returns whether *every* bit pattern of this type's canonical-ABI image
+    /// is a valid value, so its bytes can be transferred verbatim with **no
+    /// validation** at all.
+    ///
+    /// This is the stricter cousin of
+    /// [`is_cabi_inline`](Type::is_cabi_inline): it is `true` only for the
+    /// signed and unsigned integers, [`Float32`](Type::Float32),
+    /// [`Float64`](Type::Float64), and [`record`](Type::Record)s,
+    /// [`tuple`](Type::Tuple)s, and fixed-length lists composed transitively
+    /// of only those. Every such type is also
+    /// [`is_cabi_inline`](Type::is_cabi_inline), but the converse does not
+    /// hold: [`bool`](Type::Bool), [`char`](Type::Char),
+    /// [`enum`](Type::Enum), and [`flags`](Type::Flags) are inline yet have
+    /// bit patterns a runtime must reject, and therefore need a validation
+    /// sweep before an unchecked bulk transfer could be trusted.
+    ///
+    /// Note that `float32`/`float64` are included: every bit pattern is *a*
+    /// float. Canonical NaN payload canonicalization is not attempted for
+    /// bulk-copied floats, matching the fully-dynamic `Val` path which also
+    /// copies float bits verbatim.
+    pub fn are_all_bit_patterns_valid(&self) -> bool {
+        match self {
+            Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64 => true,
+            Type::Record(h) => {
+                interface_type_all_bit_patterns_valid(&h.0.types, &InterfaceType::Record(h.0.index))
+            }
+            Type::Tuple(h) => {
+                interface_type_all_bit_patterns_valid(&h.0.types, &InterfaceType::Tuple(h.0.index))
+            }
+            Type::FixedLengthList(h) => interface_type_all_bit_patterns_valid(
+                &h.0.types,
+                &InterfaceType::FixedLengthList(h.0.index),
+            ),
+            Type::Bool
+            | Type::Char
+            | Type::String
+            | Type::List(_)
+            | Type::Map(_)
+            | Type::Variant(_)
+            | Type::Enum(_)
+            | Type::Option(_)
+            | Type::Result(_)
+            | Type::Flags(_)
+            | Type::Own(_)
+            | Type::Borrow(_)
+            | Type::Future(_)
+            | Type::Stream(_)
+            | Type::ErrorContext => false,
+        }
+    }
+
     /// Retrieve the inner [`List`] of a [`Type::List`].
     ///
     /// # Panics
@@ -1284,5 +1407,111 @@ impl ComponentItem {
             }
             Export::Type(idx) => Self::from(engine, idx, ty),
         }
+    }
+}
+
+/// Shared recursive implementation of [`Type::is_cabi_inline`] over the
+/// internal type tables.
+///
+/// This is the single source of truth for the "inline" classification: the
+/// public [`Type::is_cabi_inline`] dispatches here for composite types, and
+/// internal lowering machinery queries it directly with an [`InterfaceType`].
+pub(crate) fn interface_type_is_cabi_inline(types: &ComponentTypes, ty: &InterfaceType) -> bool {
+    match ty {
+        InterfaceType::Bool
+        | InterfaceType::S8
+        | InterfaceType::U8
+        | InterfaceType::S16
+        | InterfaceType::U16
+        | InterfaceType::S32
+        | InterfaceType::U32
+        | InterfaceType::S64
+        | InterfaceType::U64
+        | InterfaceType::Float32
+        | InterfaceType::Float64
+        | InterfaceType::Char
+        | InterfaceType::Enum(_)
+        | InterfaceType::Flags(_) => true,
+        InterfaceType::Record(i) => types[*i]
+            .fields
+            .iter()
+            .all(|f| interface_type_is_cabi_inline(types, &f.ty)),
+        InterfaceType::Tuple(i) => types[*i]
+            .types
+            .iter()
+            .all(|t| interface_type_is_cabi_inline(types, t)),
+        InterfaceType::Option(i) => interface_type_is_cabi_inline(types, &types[*i].ty),
+        InterfaceType::Result(i) => {
+            let ty = &types[*i];
+            ty.ok
+                .iter()
+                .chain(ty.err.iter())
+                .all(|t| interface_type_is_cabi_inline(types, t))
+        }
+        InterfaceType::Variant(i) => types[*i]
+            .cases
+            .values()
+            .filter_map(|c| c.as_ref())
+            .all(|t| interface_type_is_cabi_inline(types, t)),
+        InterfaceType::FixedLengthList(i) => {
+            interface_type_is_cabi_inline(types, &types[*i].element)
+        }
+        InterfaceType::String
+        | InterfaceType::List(_)
+        | InterfaceType::Map(_)
+        | InterfaceType::Own(_)
+        | InterfaceType::Borrow(_)
+        | InterfaceType::Future(_)
+        | InterfaceType::Stream(_)
+        | InterfaceType::ErrorContext(_) => false,
+    }
+}
+
+/// Shared recursive implementation of [`Type::are_all_bit_patterns_valid`]
+/// over the internal type tables.
+///
+/// As with [`interface_type_is_cabi_inline`] this is the single source of
+/// truth, used by both the public reflection API and internal machinery.
+pub(crate) fn interface_type_all_bit_patterns_valid(
+    types: &ComponentTypes,
+    ty: &InterfaceType,
+) -> bool {
+    match ty {
+        InterfaceType::S8
+        | InterfaceType::U8
+        | InterfaceType::S16
+        | InterfaceType::U16
+        | InterfaceType::S32
+        | InterfaceType::U32
+        | InterfaceType::S64
+        | InterfaceType::U64
+        | InterfaceType::Float32
+        | InterfaceType::Float64 => true,
+        InterfaceType::Record(i) => types[*i]
+            .fields
+            .iter()
+            .all(|f| interface_type_all_bit_patterns_valid(types, &f.ty)),
+        InterfaceType::Tuple(i) => types[*i]
+            .types
+            .iter()
+            .all(|t| interface_type_all_bit_patterns_valid(types, t)),
+        InterfaceType::FixedLengthList(i) => {
+            interface_type_all_bit_patterns_valid(types, &types[*i].element)
+        }
+        InterfaceType::Bool
+        | InterfaceType::Char
+        | InterfaceType::String
+        | InterfaceType::List(_)
+        | InterfaceType::Map(_)
+        | InterfaceType::Variant(_)
+        | InterfaceType::Enum(_)
+        | InterfaceType::Option(_)
+        | InterfaceType::Result(_)
+        | InterfaceType::Flags(_)
+        | InterfaceType::Own(_)
+        | InterfaceType::Borrow(_)
+        | InterfaceType::Future(_)
+        | InterfaceType::Stream(_)
+        | InterfaceType::ErrorContext(_) => false,
     }
 }
