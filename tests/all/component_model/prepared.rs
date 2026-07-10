@@ -720,3 +720,233 @@ fn view_checked_sweeps_guest_results() -> Result<()> {
 
     Ok(())
 }
+
+/// The per-node mixing case: a record whose big `list<f32>` field crosses as
+/// pre-validated flat bytes while its scalar field is a dynamic `Val` — one
+/// *value*, two strategies.
+#[test]
+fn record_mixes_flat_and_val_fields() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    // param: record { data: list<float32>, scale: float32 } — flattens to
+    // (i32, i32, f32); result is returned indirectly.
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(
+            r#"
+            (type $L' (list float32))
+            (export $L "l" (type $L'))
+            (type $Foo' (record (field "data" $L) (field "scale" float32)))"#,
+            &[
+                super::Param(super::Type::I32, Some(0)),
+                super::Param(super::Type::I32, Some(4)),
+                super::Param(super::Type::F32, Some(8)),
+            ],
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    // Reflect the record's `data` element type for the proof.
+    let param = func.ty(&store).params().next().unwrap().1;
+    let data_elem = param
+        .unwrap_record()
+        .fields()
+        .next()
+        .unwrap()
+        .ty
+        .unwrap_list()
+        .ty();
+
+    let samples = [1.5f32, -2.25, 3.75, 0.0];
+    let mut bytes = Vec::new();
+    for s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let scale = Val::Float32(0.5);
+
+    let mut output = [Val::Bool(false)];
+    func.prepare_call(
+        &store,
+        &[ValSpec::Record(vec![ValSpec::ListFlat, ValSpec::Val])],
+    )?
+    .bind()
+    .arg(ValSource::Record(vec![
+        ValSource::ListFlat(ValidatedCabiBytes::checked(&bytes, &data_elem)?),
+        ValSource::Val(&scale),
+    ]))
+    .invoke(&mut store, &mut output)?;
+
+    let expected = Val::Record(vec![
+        (
+            "data".to_string(),
+            Val::List(samples.iter().copied().map(Val::Float32).collect()),
+        ),
+        ("scale".to_string(), Val::Float32(0.5)),
+    ]);
+    assert_eq!(output[0], expected);
+
+    // Byte-identical to the all-`Val` path.
+    let mut output_val = [Val::Bool(false)];
+    func.call(&mut store, &[expected.clone()], &mut output_val)?;
+    assert_eq!(output, output_val);
+
+    Ok(())
+}
+
+/// Guest-obliviousness: the same `list<u32>` provided three ways — one `Val`,
+/// flat validated bytes, and per-element sources — produces identical results
+/// from the same guest.
+#[test]
+fn same_list_three_backings() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    let element = param_elem(&store, &func, 0);
+    let values = [11u32, 22, 33, 44];
+    let expected = Val::List(values.iter().copied().map(Val::U32).collect());
+
+    // (1) One dynamic Val.
+    let mut out_val = [Val::Bool(false)];
+    func.prepare_call(&store, &[ValSpec::Val])?
+        .bind()
+        .arg_val(&expected)
+        .invoke(&mut store, &mut out_val)?;
+
+    // (2) Flat validated bytes.
+    let bytes = u32_list_bytes(&values);
+    let mut out_flat = [Val::Bool(false)];
+    func.prepare_call(&store, &[ValSpec::ListFlat])?
+        .bind()
+        .arg(ValSource::ListFlat(ValidatedCabiBytes::checked(
+            &bytes, &element,
+        )?))
+        .invoke(&mut store, &mut out_flat)?;
+
+    // (3) Per-element sources.
+    let elems: Vec<Val> = values.iter().copied().map(Val::U32).collect();
+    let mut out_elems = [Val::Bool(false)];
+    func.prepare_call(&store, &[ValSpec::ListElems(Box::new(ValSpec::Val))])?
+        .bind()
+        .arg(ValSource::ListElems(
+            elems.iter().map(ValSource::Val).collect(),
+        ))
+        .invoke(&mut store, &mut out_elems)?;
+
+    assert_eq!(out_val[0], expected);
+    assert_eq!(out_val, out_flat);
+    assert_eq!(out_val, out_elems);
+    Ok(())
+}
+
+/// A nested tree: `list<record{x, y}>` supplied as per-element `Record`
+/// sources whose fields are `Val`s, matching the all-`Val` path.
+#[test]
+fn nested_list_of_record_sources() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(
+            r#"
+            (type $R' (record (field "x" u32) (field "y" u32)))
+            (export $R "r" (type $R'))
+            (type $Foo' (list $R))"#,
+            &[
+                super::Param(super::Type::I32, Some(0)),
+                super::Param(super::Type::I32, Some(4)),
+            ],
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    let points = [(1u32, 2u32), (3, 4), (5, 6)];
+    let xs: Vec<Val> = points.iter().map(|(x, _)| Val::U32(*x)).collect();
+    let ys: Vec<Val> = points.iter().map(|(_, y)| Val::U32(*y)).collect();
+
+    let spec = ValSpec::ListElems(Box::new(ValSpec::Record(vec![ValSpec::Val, ValSpec::Val])));
+    let sources: Vec<ValSource<'_>> = xs
+        .iter()
+        .zip(&ys)
+        .map(|(x, y)| ValSource::Record(vec![ValSource::Val(x), ValSource::Val(y)]))
+        .collect();
+
+    let mut output = [Val::Bool(false)];
+    func.prepare_call(&store, &[spec])?
+        .bind()
+        .arg(ValSource::ListElems(sources))
+        .invoke(&mut store, &mut output)?;
+
+    let expected = Val::List(
+        points
+            .iter()
+            .map(|(x, y)| {
+                Val::Record(vec![
+                    ("x".to_string(), Val::U32(*x)),
+                    ("y".to_string(), Val::U32(*y)),
+                ])
+            })
+            .collect(),
+    );
+    assert_eq!(output[0], expected);
+    Ok(())
+}
+
+/// Recursive spec validation failures are caught at prepare time.
+#[test]
+fn tree_spec_rejections() -> Result<()> {
+    let engine = engine();
+    let mut store = Store::new(&engine, ());
+
+    // Record spec on a non-record parameter.
+    let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+    let err = func
+        .prepare_call(&store, &[ValSpec::Record(vec![])])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a `record` parameter"),
+        "unexpected error: {err}"
+    );
+
+    // ListElems spec whose element spec is invalid for the element type.
+    let err = func
+        .prepare_call(
+            &store,
+            &[ValSpec::ListElems(Box::new(ValSpec::ListFlat))],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a `list` parameter"),
+        "unexpected error: {err}"
+    );
+
+    // Record spec arity mismatch against the record's field count.
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(
+            r#"
+            (type $Foo' (record (field "x" u32) (field "y" u32)))"#,
+            &[
+                super::Param(super::Type::I32, Some(0)),
+                super::Param(super::Type::I32, Some(4)),
+            ],
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+    let err = func
+        .prepare_call(&store, &[ValSpec::Record(vec![ValSpec::Val])])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("field spec"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}

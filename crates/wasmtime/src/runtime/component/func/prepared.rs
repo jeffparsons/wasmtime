@@ -54,7 +54,7 @@ use wasmtime_environ::component::{
 /// This enum is `#[non_exhaustive]` because further strategies are
 /// anticipated and will be added without a breaking change, mirroring
 /// [`ValSource`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ValSpec {
     /// The argument will be supplied as a dynamic [`Val`]
@@ -77,6 +77,121 @@ pub enum ValSpec {
     ///
     /// [`ValidatedCabiBytes`]: crate::component::ValidatedCabiBytes
     ListFlat,
+
+    /// The argument is a `record` supplied field by field
+    /// ([`ValSource::Record`]), each field with its own independently-chosen
+    /// spec, in declaration order.
+    ///
+    /// Only valid when the parameter is a `record` with exactly this many
+    /// fields and each field spec is valid for its field type. This is the
+    /// spec that lets one *value* mix strategies — e.g. a record whose
+    /// `list<f32>` field is [`ListFlat`](ValSpec::ListFlat) while its scalar
+    /// fields are [`Val`](ValSpec::Val).
+    Record(Vec<ValSpec>),
+
+    /// The argument is a `list<T>` supplied element by element
+    /// ([`ValSource::ListElems`]), every element using the given spec.
+    ///
+    /// Only valid when the parameter is a `list` and the element spec is
+    /// valid for the element type. The guest sees the same contiguous memory
+    /// image as any other list strategy.
+    ListElems(Box<ValSpec>),
+}
+
+impl ValSpec {
+    /// Validate that this spec is a legal way to supply a parameter of type
+    /// `param` — the once-per-`prepare_call` structural check.
+    fn validate(&self, index: usize, param: &Type) -> Result<()> {
+        match self {
+            ValSpec::Val => Ok(()),
+            ValSpec::ListFlat => match param {
+                Type::List(list) if list.ty().is_cabi_inline() => Ok(()),
+                Type::List(_) => bail!(
+                    "argument {index}: `ValSpec::ListFlat` requires a `list` whose element \
+                     type has a fixed inline canonical-ABI layout (no strings, lists, or \
+                     resources), which this parameter's element type does not"
+                ),
+                _ => bail!(
+                    "argument {index}: `ValSpec::ListFlat` requires a `list` parameter, but \
+                     this parameter is not a list"
+                ),
+            },
+            ValSpec::Record(specs) => match param {
+                Type::Record(record) => {
+                    if record.fields().len() != specs.len() {
+                        bail!(
+                            "argument {index}: `ValSpec::Record` has {} field spec(s) but the \
+                             parameter record has {} field(s)",
+                            specs.len(),
+                            record.fields().len(),
+                        );
+                    }
+                    for (spec, field) in specs.iter().zip(record.fields()) {
+                        spec.validate(index, &field.ty)?;
+                    }
+                    Ok(())
+                }
+                _ => bail!(
+                    "argument {index}: `ValSpec::Record` requires a `record` parameter, but \
+                     this parameter is not a record"
+                ),
+            },
+            ValSpec::ListElems(spec) => match param {
+                Type::List(list) => spec.validate(index, &list.ty()),
+                _ => bail!(
+                    "argument {index}: `ValSpec::ListElems` requires a `list` parameter, but \
+                     this parameter is not a list"
+                ),
+            },
+        }
+    }
+
+    /// Validate that a bound source matches this spec (and, for `ListFlat`
+    /// nodes, that its proof's element type structurally equals the
+    /// parameter's element type) — the recursive per-`invoke` check.
+    fn check_source(&self, index: usize, source: &ValSource<'_>, param: &Type) -> Result<()> {
+        match (self, source) {
+            (ValSpec::Val, ValSource::Val(_)) => Ok(()),
+            (ValSpec::ListFlat, ValSource::ListFlat(vb)) => {
+                let elem = param.unwrap_list().ty();
+                if vb.ty() != &elem {
+                    bail!(
+                        "argument {index}: buffer holds validated `{}` images but the \
+                         parameter's element type is `{}`",
+                        vb.ty().desc(),
+                        elem.desc(),
+                    );
+                }
+                Ok(())
+            }
+            (ValSpec::Record(specs), ValSource::Record(children)) => {
+                if children.len() != specs.len() {
+                    bail!(
+                        "argument {index}: bound {} record field source(s) but the spec has {}",
+                        children.len(),
+                        specs.len(),
+                    );
+                }
+                let record = param.unwrap_record();
+                for ((spec, child), field) in specs.iter().zip(children).zip(record.fields()) {
+                    spec.check_source(index, child, &field.ty)?;
+                }
+                Ok(())
+            }
+            (ValSpec::ListElems(spec), ValSource::ListElems(children)) => {
+                let elem = param.unwrap_list().ty();
+                for child in children {
+                    spec.check_source(index, child, &elem)?;
+                }
+                Ok(())
+            }
+            (spec, source) => bail!(
+                "argument {index}: bound source `{}` does not match the prepared \
+                 `ValSpec::{spec:?}`",
+                source.desc(),
+            ),
+        }
+    }
 }
 
 /// A validated, reusable component call shape.
@@ -234,35 +349,17 @@ impl<'a> BoundCall<'a> {
             );
         }
 
-        // Validate that each bound source matches its prepared spec — and for
-        // `ListFlat`, that the proof was minted for a type structurally equal
-        // to the parameter's element type — *before* entering the guest, so a
-        // mismatch is a clean error rather than surfacing mid-lowering after
-        // guest memory has been allocated. Note the structural (not
-        // identity) equality: a proof minted against one component's
-        // reflected type is accepted by any other component's structurally
-        // equal type, which is what lets validated bytes flow between
-        // instances.
+        // Validate that each bound source matches its prepared spec — and
+        // that every `ListFlat` node's proof was minted for a type
+        // structurally equal to its position's element type — *before*
+        // entering the guest, so a mismatch is a clean error rather than
+        // surfacing mid-lowering after guest memory has been allocated. Note
+        // the structural (not identity) equality: a proof minted against one
+        // component's reflected type is accepted by any other component's
+        // structurally equal type, which is what lets validated bytes flow
+        // between instances.
         for (index, ((spec, source), param)) in specs.iter().zip(sources).zip(params).enumerate() {
-            match (spec, source) {
-                (ValSpec::Val, ValSource::Val(_)) => {}
-                (ValSpec::ListFlat, ValSource::ListFlat(vb)) => {
-                    let elem = param.unwrap_list().ty();
-                    if vb.ty() != &elem {
-                        bail!(
-                            "argument {index}: buffer holds validated `{}` images but the \
-                             parameter's element type is `{}`",
-                            vb.ty().desc(),
-                            elem.desc(),
-                        );
-                    }
-                }
-                (spec, source) => bail!(
-                    "argument {index}: bound source `{}` does not match the prepared \
-                     `ValSpec::{spec:?}`",
-                    source.desc(),
-                ),
-            }
+            spec.check_source(index, source, param)?;
         }
 
         if func.abi_async(store.0) {
@@ -342,21 +439,7 @@ impl Func {
         }
 
         for (index, (spec, param)) in specs.iter().zip(&params).enumerate() {
-            match spec {
-                ValSpec::Val => {}
-                ValSpec::ListFlat => match param {
-                    Type::List(list) if list.ty().is_cabi_inline() => {}
-                    Type::List(_) => bail!(
-                        "argument {index}: `ValSpec::ListFlat` requires a `list` whose element \
-                         type has a fixed inline canonical-ABI layout (no strings, lists, or \
-                         resources), which this parameter's element type does not"
-                    ),
-                    _ => bail!(
-                        "argument {index}: `ValSpec::ListFlat` requires a `list` parameter, but \
-                         this parameter is not a list"
-                    ),
-                },
-            }
+            spec.validate(index, param)?;
         }
 
         Ok(PreparedCall {

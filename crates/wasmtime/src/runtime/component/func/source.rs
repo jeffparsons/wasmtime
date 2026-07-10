@@ -58,6 +58,24 @@ pub enum ValSource<'a> {
     /// [`ValidatedCabiBytes::checked`], lowering re-checks nothing per
     /// element.
     ListFlat(ValidatedCabiBytes<'a>),
+
+    /// A `record` provided field by field, each field with its own
+    /// independently-chosen source.
+    ///
+    /// This is what lets a single value mix strategies: a record holding a
+    /// large `list<f32>` column and a scalar can supply the column as
+    /// [`ListFlat`](ValSource::ListFlat) bytes and the scalar as a
+    /// [`Val`](ValSource::Val). Sources are given in declaration order and
+    /// must match the record's field count.
+    Record(Vec<ValSource<'a>>),
+
+    /// A `list<T>` provided element by element, each element with its own
+    /// independently-chosen source.
+    ///
+    /// The elements are lowered into one contiguous guest allocation, exactly
+    /// as a [`Val::List`] would be — the guest cannot tell which host-side
+    /// representation supplied any element.
+    ListElems(Vec<ValSource<'a>>),
 }
 
 impl ValSource<'_> {
@@ -67,6 +85,8 @@ impl ValSource<'_> {
         match self {
             ValSource::Val(val) => val.desc(),
             ValSource::ListFlat(_) => "flat list bytes",
+            ValSource::Record(_) => "per-field record sources",
+            ValSource::ListElems(_) => "per-element list sources",
         }
     }
 
@@ -88,6 +108,35 @@ impl ValSource<'_> {
                 };
                 let element = cx.types[t].element;
                 let (ptr, len) = lower_list_flat(cx, element, vb)?;
+                next_mut(dst).write(ValRaw::i64(ptr as i64));
+                next_mut(dst).write(ValRaw::i64(len as i64));
+                return Ok(());
+            }
+            ValSource::Record(fields) => {
+                let InterfaceType::Record(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide per-field record sources for {}",
+                        desc(&ty)
+                    );
+                };
+                let t = &cx.types[t];
+                if t.fields.len() != fields.len() {
+                    bail!("expected {} fields, got {}", t.fields.len(), fields.len());
+                }
+                for (source, field) in fields.iter().zip(t.fields.iter()) {
+                    source.lower(cx, field.ty, dst)?;
+                }
+                return Ok(());
+            }
+            ValSource::ListElems(items) => {
+                let InterfaceType::List(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide per-element list sources for {}",
+                        desc(&ty)
+                    );
+                };
+                let element = cx.types[t].element;
+                let (ptr, len) = lower_list_elems(cx, element, items)?;
                 next_mut(dst).write(ValRaw::i64(ptr as i64));
                 next_mut(dst).write(ValRaw::i64(len as i64));
                 return Ok(());
@@ -275,6 +324,43 @@ impl ValSource<'_> {
                 };
                 let element = cx.types[t].element;
                 let (ptr, len) = lower_list_flat(cx, element, vb)?;
+                // FIXME(#4311): needs memory64 handling
+                *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
+                *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
+                return Ok(());
+            }
+            ValSource::Record(fields) => {
+                let InterfaceType::Record(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide per-field record sources for {}",
+                        desc(&ty)
+                    );
+                };
+                let t = &cx.types[t];
+                if t.fields.len() != fields.len() {
+                    bail!("expected {} fields, got {}", t.fields.len(), fields.len());
+                }
+                let mut offset = offset;
+                for (source, field) in fields.iter().zip(t.fields.iter()) {
+                    source.store(
+                        cx,
+                        field.ty,
+                        cx.types
+                            .canonical_abi(&field.ty)
+                            .next_field32_size(&mut offset),
+                    )?;
+                }
+                return Ok(());
+            }
+            ValSource::ListElems(items) => {
+                let InterfaceType::List(t) = ty else {
+                    bail!(
+                        "type mismatch: cannot provide per-element list sources for {}",
+                        desc(&ty)
+                    );
+                };
+                let element = cx.types[t].element;
+                let (ptr, len) = lower_list_elems(cx, element, items)?;
                 // FIXME(#4311): needs memory64 handling
                 *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
                 *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
@@ -616,6 +702,33 @@ fn lower_list_flat<T>(
     let ptr = cx.realloc(0, 0, elt_align, bytes.len())?;
     cx.as_slice_mut()[ptr..][..bytes.len()].copy_from_slice(bytes);
     Ok((ptr, count))
+}
+
+/// Lower a `list<T>` from per-element sources: one contiguous guest
+/// allocation, each element lowered by its own strategy into its slot.
+///
+/// The byte-for-byte mirror of `lower_list` (the all-`Val` case), which is
+/// what keeps the guest oblivious to the host-side representation: the same
+/// guest memory image results no matter which strategy produced each element.
+fn lower_list_elems<T>(
+    cx: &mut LowerContext<'_, T>,
+    element_type: InterfaceType,
+    items: &[ValSource<'_>],
+) -> Result<(usize, usize)> {
+    let abi = cx.types.canonical_abi(&element_type);
+    let elt_size = usize::try_from(abi.size32)?;
+    let elt_align = abi.align32;
+    let size = items
+        .len()
+        .checked_mul(elt_size)
+        .ok_or_else(|| crate::format_err!("size overflow copying a list"))?;
+    let ptr = cx.realloc(0, 0, elt_align, size)?;
+    let mut element_ptr = ptr;
+    for item in items {
+        item.store(cx, element_type, element_ptr)?;
+        element_ptr += elt_size;
+    }
+    Ok((ptr, items.len()))
 }
 
 /// Lower a list with the specified element type and values.
