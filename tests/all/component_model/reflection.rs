@@ -19,7 +19,7 @@ use wasmtime::{Result, Store};
 ///
 /// Wrapping the type of interest in a `list` keeps the echo component's core
 /// signature uniform (a pointer/length pair) no matter how gnarly `X` is.
-fn list_element_type(engine: &wasmtime::Engine, decls: &str) -> Result<Type> {
+pub(super) fn list_element_type(engine: &wasmtime::Engine, decls: &str) -> Result<Type> {
     let mut store = Store::new(engine, ());
     let component = Component::new(
         engine,

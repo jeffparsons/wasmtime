@@ -26,6 +26,7 @@ mod reflection;
 mod resources;
 mod strings;
 mod sync_call_inline;
+mod validated;
 
 #[derive(Copy, Clone)]
 enum ApiStyle {

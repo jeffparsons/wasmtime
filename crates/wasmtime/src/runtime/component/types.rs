@@ -910,6 +910,51 @@ impl Type {
         }
     }
 
+    /// Internal: recover the `(type tables, InterfaceType)` pair behind this
+    /// public type, for types that can carry one.
+    ///
+    /// Primitive leaf types have no handle and therefore no type tables —
+    /// they are returned with `None` tables, which is fine because no
+    /// classification or validation of a primitive ever needs a table
+    /// lookup. Types whose `InterfaceType` cannot be reconstructed from the
+    /// public representation (resources, futures, streams, error-contexts,
+    /// and the out-of-line `string`/`list`/`map`) return `None` overall;
+    /// every `is_cabi_inline` type returns `Some`.
+    pub(crate) fn as_inline_parts(&self) -> Option<(Option<&Arc<ComponentTypes>>, InterfaceType)> {
+        match self {
+            Type::Bool => Some((None, InterfaceType::Bool)),
+            Type::S8 => Some((None, InterfaceType::S8)),
+            Type::U8 => Some((None, InterfaceType::U8)),
+            Type::S16 => Some((None, InterfaceType::S16)),
+            Type::U16 => Some((None, InterfaceType::U16)),
+            Type::S32 => Some((None, InterfaceType::S32)),
+            Type::U32 => Some((None, InterfaceType::U32)),
+            Type::S64 => Some((None, InterfaceType::S64)),
+            Type::U64 => Some((None, InterfaceType::U64)),
+            Type::Float32 => Some((None, InterfaceType::Float32)),
+            Type::Float64 => Some((None, InterfaceType::Float64)),
+            Type::Char => Some((None, InterfaceType::Char)),
+            Type::Enum(h) => Some((Some(&h.0.types), InterfaceType::Enum(h.0.index))),
+            Type::Flags(h) => Some((Some(&h.0.types), InterfaceType::Flags(h.0.index))),
+            Type::Record(h) => Some((Some(&h.0.types), InterfaceType::Record(h.0.index))),
+            Type::Tuple(h) => Some((Some(&h.0.types), InterfaceType::Tuple(h.0.index))),
+            Type::Variant(h) => Some((Some(&h.0.types), InterfaceType::Variant(h.0.index))),
+            Type::Option(h) => Some((Some(&h.0.types), InterfaceType::Option(h.0.index))),
+            Type::Result(h) => Some((Some(&h.0.types), InterfaceType::Result(h.0.index))),
+            Type::FixedLengthList(h) => {
+                Some((Some(&h.0.types), InterfaceType::FixedLengthList(h.0.index)))
+            }
+            Type::String
+            | Type::List(_)
+            | Type::Map(_)
+            | Type::Own(_)
+            | Type::Borrow(_)
+            | Type::Future(_)
+            | Type::Stream(_)
+            | Type::ErrorContext => None,
+        }
+    }
+
     /// Retrieve the inner [`List`] of a [`Type::List`].
     ///
     /// # Panics
@@ -1074,7 +1119,7 @@ impl Type {
         }
     }
 
-    fn desc(&self) -> &'static str {
+    pub(crate) fn desc(&self) -> &'static str {
         match self {
             Type::Bool => "bool",
             Type::S8 => "s8",

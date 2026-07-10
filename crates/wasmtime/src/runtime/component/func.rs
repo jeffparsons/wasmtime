@@ -19,10 +19,12 @@ mod host;
 mod options;
 mod source;
 mod typed;
+mod validated;
 pub use self::host::*;
 pub use self::options::*;
 pub(crate) use self::source::ValSource;
 pub use self::typed::*;
+pub use self::validated::{ValidatedCabiBytes, ValidatedCabiBytesBuf};
 
 /// A WebAssembly component function which can be called.
 ///
