@@ -6,6 +6,11 @@ Unreleased.
 
 ### Changed
 
+* The `memcpy` fast path for component-model stream copies now applies to
+  composite payload types -- `record`s, `tuple`s, and fixed-length lists made
+  up transitively of integers and floats -- rather than to bare numeric
+  payloads only.
+
 --------------------------------------------------------------------------------
 
 Release notes for previous releases of Wasmtime can be found on the respective

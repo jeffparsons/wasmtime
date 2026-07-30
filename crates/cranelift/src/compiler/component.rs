@@ -861,32 +861,20 @@ impl<'a> TrampolineCompiler<'a> {
     /// Determine whether the specified type can be optimized as a stream
     /// payload by lifting and lowering with a simple `memcpy`.
     ///
-    /// Any type containing only "flat", primitive data for which all bit
-    /// patterns are valid (i.e. no pointers, handles, bools, or chars) should
-    /// qualify for this optimization, but it's also okay to conservatively
-    /// return `None` here; the fallback slow path will always work -- it just
-    /// won't be as efficient.
+    /// This is exactly the set of types which
+    /// `ComponentTypes::is_bitwise_copyable` accepts: those whose canonical
+    /// ABI image is entirely made up of value bytes for which all bit patterns
+    /// are valid, so the destination component both ends up with a valid value
+    /// and learns nothing beyond it. It's also okay to conservatively return
+    /// `None` here; the fallback slow path will always work -- it just won't be
+    /// as efficient.
     fn flat_stream_element_info(&self, ty: TypeStreamTableIndex) -> Option<&CanonicalAbiInfo> {
-        let payload = self.types[self.types[ty].ty].payload;
-        match payload {
+        match self.types[self.types[ty].ty].payload {
             None => Some(&CanonicalAbiInfo::ZERO),
-            Some(
-                // Note that we exclude `Bool` and `Char` from this list because
-                // not all bit patterns are valid for those types.
-                payload @ (InterfaceType::S8
-                | InterfaceType::U8
-                | InterfaceType::S16
-                | InterfaceType::U16
-                | InterfaceType::S32
-                | InterfaceType::U32
-                | InterfaceType::S64
-                | InterfaceType::U64
-                | InterfaceType::Float32
-                | InterfaceType::Float64),
-            ) => Some(self.types.canonical_abi(&payload)),
-            // TODO: Recursively check for other "flat" types (i.e. those without pointers or handles),
-            // e.g. `record`s, `variant`s, etc. which contain only flat types.
-            _ => None,
+            Some(payload) if self.types.is_bitwise_copyable(&payload) => {
+                Some(self.types.canonical_abi(&payload))
+            }
+            Some(_) => None,
         }
     }
 
