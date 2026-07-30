@@ -813,6 +813,11 @@ impl ComponentTypesBuilder {
         self.component_types.canonical_abi(ty)
     }
 
+    /// See [`ComponentTypes::is_bitwise_copyable`].
+    pub fn is_bitwise_copyable(&self, ty: &InterfaceType) -> bool {
+        self.component_types.is_bitwise_copyable(ty)
+    }
+
     /// Returns the "flat types" for the given interface type used in the
     /// canonical ABI.
     ///

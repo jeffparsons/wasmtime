@@ -387,6 +387,237 @@ impl ComponentTypes {
         }
     }
 
+    /// Returns whether a value of type `ty` is stored entirely *inline* in its
+    /// canonical ABI representation: a fixed byte layout with no out-of-line
+    /// storage (no `string`, `list`, or `map`, whose elements live elsewhere
+    /// in linear memory) and no ownership (no resource handles, futures,
+    /// streams, or error-contexts, which name entries in per-instance tables
+    /// rather than being plain bytes).
+    ///
+    /// Being inline means the bytes of a value are the whole value, so they
+    /// can be moved from one place to another with a single copy. It does not
+    /// mean that an arbitrary byte image is a *valid* value, though: an inline
+    /// type may still have invalid bit patterns, such as a `bool` other than 0
+    /// or 1, or an out-of-range `enum` discriminant. See
+    /// [`ComponentTypes::are_all_bit_patterns_valid`] for that stronger
+    /// property.
+    pub fn is_cabi_inline(&self, ty: &InterfaceType) -> bool {
+        match ty {
+            InterfaceType::Bool
+            | InterfaceType::S8
+            | InterfaceType::U8
+            | InterfaceType::S16
+            | InterfaceType::U16
+            | InterfaceType::S32
+            | InterfaceType::U32
+            | InterfaceType::S64
+            | InterfaceType::U64
+            | InterfaceType::Float32
+            | InterfaceType::Float64
+            | InterfaceType::Char
+            | InterfaceType::Enum(_)
+            | InterfaceType::Flags(_) => true,
+
+            InterfaceType::Record(i) => self[*i].fields.iter().all(|f| self.is_cabi_inline(&f.ty)),
+            InterfaceType::Tuple(i) => self[*i].types.iter().all(|t| self.is_cabi_inline(t)),
+            InterfaceType::Variant(i) => self[*i]
+                .cases
+                .values()
+                .flatten()
+                .all(|t| self.is_cabi_inline(t)),
+            InterfaceType::Option(i) => self.is_cabi_inline(&self[*i].ty),
+            InterfaceType::Result(i) => {
+                let ty = &self[*i];
+                ty.ok
+                    .iter()
+                    .chain(ty.err.iter())
+                    .all(|t| self.is_cabi_inline(t))
+            }
+            InterfaceType::FixedLengthList(i) => self.is_cabi_inline(&self[*i].element),
+
+            InterfaceType::String
+            | InterfaceType::List(_)
+            | InterfaceType::Map(_)
+            | InterfaceType::Own(_)
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => false,
+        }
+    }
+
+    /// Returns whether *every* bit pattern of the canonical ABI image of `ty`
+    /// is a valid value of `ty`, meaning that an arbitrary byte image can be
+    /// interpreted as a value with no validation at all.
+    ///
+    /// This is the stricter cousin of [`ComponentTypes::is_cabi_inline`]: it
+    /// holds only for the signed and unsigned integers, `float32`, `float64`,
+    /// and the `record`s, `tuple`s, and fixed-length lists composed
+    /// transitively of only those. Every such type is also inline, but the
+    /// converse does not hold: `bool`, `char`, `enum`, `flags`, and the
+    /// discriminated types (`variant`, `option`, `result`) are inline yet have
+    /// bit patterns which must be rejected, so they need a validation sweep
+    /// before their bytes could be trusted.
+    ///
+    /// Note that `float32`/`float64` are included: every bit pattern is *a*
+    /// float. NaN payload canonicalization is not considered here, matching
+    /// the fully dynamic `Val` paths which also copy float bits verbatim.
+    ///
+    /// This says nothing about *padding* within the image; see
+    /// [`ComponentTypes::is_bitwise_copyable`] for the property required to
+    /// transfer bytes verbatim between two components.
+    pub fn are_all_bit_patterns_valid(&self, ty: &InterfaceType) -> bool {
+        match ty {
+            InterfaceType::S8
+            | InterfaceType::U8
+            | InterfaceType::S16
+            | InterfaceType::U16
+            | InterfaceType::S32
+            | InterfaceType::U32
+            | InterfaceType::S64
+            | InterfaceType::U64
+            | InterfaceType::Float32
+            | InterfaceType::Float64 => true,
+
+            InterfaceType::Record(i) => self[*i]
+                .fields
+                .iter()
+                .all(|f| self.are_all_bit_patterns_valid(&f.ty)),
+            InterfaceType::Tuple(i) => self[*i]
+                .types
+                .iter()
+                .all(|t| self.are_all_bit_patterns_valid(t)),
+            InterfaceType::FixedLengthList(i) => self.are_all_bit_patterns_valid(&self[*i].element),
+
+            InterfaceType::Bool
+            | InterfaceType::Char
+            | InterfaceType::String
+            | InterfaceType::List(_)
+            | InterfaceType::Map(_)
+            | InterfaceType::Variant(_)
+            | InterfaceType::Enum(_)
+            | InterfaceType::Option(_)
+            | InterfaceType::Result(_)
+            | InterfaceType::Flags(_)
+            | InterfaceType::Own(_)
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => false,
+        }
+    }
+
+    /// Returns whether values of type `ty` can be transferred from one
+    /// component to another by copying their canonical ABI byte images
+    /// verbatim, with no lifting, lowering, or validation in between.
+    ///
+    /// This requires two independent properties:
+    ///
+    /// * [`ComponentTypes::are_all_bit_patterns_valid`], so that the
+    ///   destination is guaranteed to hold a valid value however the source
+    ///   bytes were produced, and
+    ///
+    /// * that the image contains no padding, so that copying it does not also
+    ///   copy bytes which are not part of the value. A verbatim copy of a type
+    ///   with padding would hand the destination component whatever the source
+    ///   component happened to leave in the gaps of its own linear memory,
+    ///   which the lift/lower path never does.
+    pub fn is_bitwise_copyable(&self, ty: &InterfaceType) -> bool {
+        self.are_all_bit_patterns_valid(ty) && self.is_cabi_gapless(ty)
+    }
+
+    /// Returns whether every byte of the canonical ABI image of `ty` is part
+    /// of the value, i.e. the layout contains no padding.
+    ///
+    /// This is a property of the layout alone and is only computed for the
+    /// fixed-layout scalars and aggregates thereof; anything else
+    /// conservatively returns `false` as it is only ever consulted alongside
+    /// [`ComponentTypes::are_all_bit_patterns_valid`].
+    fn is_cabi_gapless(&self, ty: &InterfaceType) -> bool {
+        match ty {
+            // Scalars are exactly as large as the value they hold.
+            InterfaceType::Bool
+            | InterfaceType::S8
+            | InterfaceType::U8
+            | InterfaceType::S16
+            | InterfaceType::U16
+            | InterfaceType::S32
+            | InterfaceType::U32
+            | InterfaceType::S64
+            | InterfaceType::U64
+            | InterfaceType::Float32
+            | InterfaceType::Float64
+            | InterfaceType::Char => true,
+
+            InterfaceType::Record(i) => {
+                let ty = &self[*i];
+                self.fields_are_gapless(&ty.abi, ty.fields.iter().map(|f| &f.ty))
+            }
+            InterfaceType::Tuple(i) => {
+                let ty = &self[*i];
+                self.fields_are_gapless(&ty.abi, ty.types.iter())
+            }
+            InterfaceType::FixedLengthList(i) => {
+                let ty = &self[*i];
+                if !self.is_cabi_gapless(&ty.element) {
+                    return false;
+                }
+                // Elements are stored back-to-back, so the list is gapless so
+                // long as its size is exactly the size of its elements. Note
+                // that this additionally rejects lists whose size saturated
+                // when it was computed.
+                let element = self.canonical_abi(&ty.element);
+                element.size32.checked_mul(ty.size) == Some(ty.abi.size32)
+                    && element.size64.checked_mul(ty.size) == Some(ty.abi.size64)
+            }
+
+            InterfaceType::String
+            | InterfaceType::List(_)
+            | InterfaceType::Map(_)
+            | InterfaceType::Variant(_)
+            | InterfaceType::Enum(_)
+            | InterfaceType::Option(_)
+            | InterfaceType::Result(_)
+            | InterfaceType::Flags(_)
+            | InterfaceType::Own(_)
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => false,
+        }
+    }
+
+    /// Helper for [`ComponentTypes::is_cabi_gapless`] for the record-like
+    /// types whose `abi` was computed with [`CanonicalAbiInfo::record`].
+    ///
+    /// Such a layout places each field at the next offset with suitable
+    /// alignment and then rounds the total size up to the alignment of the
+    /// whole, so the layout is gapless precisely when the size of the whole is
+    /// the sum of the sizes of the fields.
+    fn fields_are_gapless<'a>(
+        &self,
+        abi: &CanonicalAbiInfo,
+        fields: impl Iterator<Item = &'a InterfaceType>,
+    ) -> bool {
+        let mut size32: u32 = 0;
+        let mut size64: u32 = 0;
+        for field in fields {
+            if !self.is_cabi_gapless(field) {
+                return false;
+            }
+            let field = self.canonical_abi(field);
+            let (Some(a), Some(b)) = (
+                size32.checked_add(field.size32),
+                size64.checked_add(field.size64),
+            ) else {
+                return false;
+            };
+            size32 = a;
+            size64 = b;
+        }
+        size32 == abi.size32 && size64 == abi.size64
+    }
+
     /// Adds a new `table` to the list of resource tables for this component.
     pub fn push_resource_table(&mut self, table: TypeResourceTable) -> TypeResourceTableIndex {
         self.resource_tables.push(table)
@@ -1393,6 +1624,7 @@ pub enum FlatType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranelift_entity::EntityRef;
 
     fn variant(cases: &[(&str, InterfaceType)]) -> TypeVariant {
         TypeVariant {
@@ -1452,5 +1684,240 @@ mod tests {
 
         assert_ne!(a, b);
         assert_eq!(a, a.clone());
+    }
+
+    /// Helpers for building up ad-hoc `ComponentTypes` tables to classify.
+    impl ComponentTypes {
+        fn record(&mut self, fields: &[InterfaceType]) -> InterfaceType {
+            let abi = CanonicalAbiInfo::record(fields.iter().map(|ty| self.canonical_abi(ty)));
+            InterfaceType::Record(
+                self.records.push(TypeRecord {
+                    fields: fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| RecordField {
+                            name: format!("f{i}"),
+                            ty: *ty,
+                        })
+                        .collect(),
+                    abi,
+                }),
+            )
+        }
+
+        fn tuple(&mut self, types: &[InterfaceType]) -> InterfaceType {
+            let abi = CanonicalAbiInfo::record(types.iter().map(|ty| self.canonical_abi(ty)));
+            InterfaceType::Tuple(self.tuples.push(TypeTuple {
+                types: types.into(),
+                abi,
+            }))
+        }
+
+        fn fixed_length_list(&mut self, element: InterfaceType, size: u32) -> InterfaceType {
+            let abi = CanonicalAbiInfo::fixed_length_list_static(
+                self.canonical_abi(&element),
+                usize::try_from(size).unwrap(),
+            );
+            InterfaceType::FixedLengthList(self.fixed_length_lists.push(TypeFixedLengthList {
+                element,
+                size,
+                abi,
+            }))
+        }
+
+        fn option(&mut self, ty: InterfaceType) -> InterfaceType {
+            InterfaceType::Option(self.options.push(TypeOption {
+                ty,
+                abi: CanonicalAbiInfo::default(),
+                info: VariantInfo {
+                    size: DiscriminantSize::Size1,
+                    payload_offset32: 4,
+                    payload_offset64: 8,
+                },
+            }))
+        }
+
+        fn variant(&mut self, cases: &[(&str, InterfaceType)]) -> InterfaceType {
+            InterfaceType::Variant(self.variants.push(variant(cases)))
+        }
+
+        fn list(&mut self, element: InterfaceType) -> InterfaceType {
+            InterfaceType::List(self.lists.push(TypeList { element }))
+        }
+    }
+
+    /// Assert that `ty` is classified as `(inline, all bit patterns valid,
+    /// bitwise copyable)`.
+    #[track_caller]
+    fn assert_classification(
+        types: &ComponentTypes,
+        ty: InterfaceType,
+        expected: (bool, bool, bool),
+    ) {
+        let actual = (
+            types.is_cabi_inline(&ty),
+            types.are_all_bit_patterns_valid(&ty),
+            types.is_bitwise_copyable(&ty),
+        );
+        assert_eq!(actual, expected, "wrong classification for {ty:?}");
+    }
+
+    #[test]
+    fn classify_scalars() {
+        let types = ComponentTypes::default();
+
+        // Integers and floats are inline, total, and gapless.
+        for ty in [
+            InterfaceType::S8,
+            InterfaceType::U8,
+            InterfaceType::S16,
+            InterfaceType::U16,
+            InterfaceType::S32,
+            InterfaceType::U32,
+            InterfaceType::S64,
+            InterfaceType::U64,
+            InterfaceType::Float32,
+            InterfaceType::Float64,
+        ] {
+            assert_classification(&types, ty, (true, true, true));
+        }
+
+        // `bool` and `char` are inline but have bit patterns which must be
+        // rejected.
+        assert_classification(&types, InterfaceType::Bool, (true, false, false));
+        assert_classification(&types, InterfaceType::Char, (true, false, false));
+    }
+
+    #[test]
+    fn classify_constrained_scalars() {
+        let mut types = ComponentTypes::default();
+        let enum_ = InterfaceType::Enum(types.enums.push(enum_(&["a", "b", "c"])));
+        let flags = InterfaceType::Flags(types.flags.push(flags(&["r", "w", "x"])));
+
+        // Both are inline, but an arbitrary discriminant or an unnamed flag bit
+        // is not a valid value.
+        assert_classification(&types, enum_, (true, false, false));
+        assert_classification(&types, flags, (true, false, false));
+    }
+
+    #[test]
+    fn classify_out_of_line_and_owning_types() {
+        let mut types = ComponentTypes::default();
+        let list = types.list(InterfaceType::U8);
+
+        // Out-of-line storage and handles are not inline, and so are neither of
+        // the stronger properties either.
+        for ty in [
+            InterfaceType::String,
+            list,
+            InterfaceType::Map(EntityRef::new(0)),
+            InterfaceType::Own(EntityRef::new(0)),
+            InterfaceType::Borrow(EntityRef::new(0)),
+            InterfaceType::Future(EntityRef::new(0)),
+            InterfaceType::Stream(EntityRef::new(0)),
+            InterfaceType::ErrorContext(EntityRef::new(0)),
+        ] {
+            assert_classification(&types, ty, (false, false, false));
+        }
+    }
+
+    #[test]
+    fn classify_records_and_tuples() {
+        let mut types = ComponentTypes::default();
+
+        // A record of scalars with no padding: fully copyable.
+        let point = types.record(&[InterfaceType::Float32, InterfaceType::Float32]);
+        assert_classification(&types, point, (true, true, true));
+        assert_eq!(types.canonical_abi(&point).size32, 8);
+
+        // Likewise for a nesting of such records, and for tuples.
+        let line = types.record(&[point, point]);
+        assert_classification(&types, line, (true, true, true));
+        let packed = types.tuple(&[InterfaceType::U8, InterfaceType::U8, InterfaceType::U16]);
+        assert_classification(&types, packed, (true, true, true));
+        assert_eq!(types.canonical_abi(&packed).size32, 4);
+
+        // A record whose layout has interior padding is still total -- every
+        // bit pattern is a valid value -- but copying its image verbatim would
+        // also copy the padding, so it is not bitwise copyable.
+        let padded = types.tuple(&[InterfaceType::U8, InterfaceType::U32]);
+        assert_classification(&types, padded, (true, true, false));
+        assert_eq!(types.canonical_abi(&padded).size32, 8);
+
+        // Same for trailing padding.
+        let trailing = types.record(&[InterfaceType::U32, InterfaceType::U8]);
+        assert_classification(&types, trailing, (true, true, false));
+        assert_eq!(types.canonical_abi(&trailing).size32, 8);
+
+        // Padding anywhere in the tree disqualifies the whole.
+        let nested_padding = types.record(&[point, padded]);
+        assert_classification(&types, nested_padding, (true, true, false));
+
+        // An empty record is vacuously all of the above.
+        let empty = types.record(&[]);
+        assert_classification(&types, empty, (true, true, true));
+
+        // Constrained members keep a record inline but not total, and
+        // out-of-line members disqualify it entirely.
+        let with_bool = types.record(&[InterfaceType::U8, InterfaceType::Bool]);
+        assert_classification(&types, with_bool, (true, false, false));
+        let with_string = types.record(&[InterfaceType::U32, InterfaceType::String]);
+        assert_classification(&types, with_string, (false, false, false));
+    }
+
+    #[test]
+    fn classify_fixed_length_lists() {
+        let mut types = ComponentTypes::default();
+
+        let point = types.record(&[InterfaceType::Float32, InterfaceType::Float32]);
+        let points = types.fixed_length_list(point, 4);
+        assert_classification(&types, points, (true, true, true));
+        assert_eq!(types.canonical_abi(&points).size32, 32);
+
+        // Elements are stored back-to-back, so padding within an element leaves
+        // padding within the list.
+        let padded = types.tuple(&[InterfaceType::U8, InterfaceType::U32]);
+        let padded_list = types.fixed_length_list(padded, 4);
+        assert_classification(&types, padded_list, (true, true, false));
+
+        // An empty list, and a list of a non-inline element.
+        let empty = types.fixed_length_list(InterfaceType::U32, 0);
+        assert_classification(&types, empty, (true, true, true));
+        let strings = types.fixed_length_list(InterfaceType::String, 4);
+        assert_classification(&types, strings, (false, false, false));
+
+        // A list so large that its size saturated when computed must not be
+        // copied verbatim using that bogus size.
+        let huge = types.fixed_length_list(InterfaceType::U32, u32::MAX);
+        assert_eq!(types.canonical_abi(&huge).size32, u32::MAX);
+        assert_classification(&types, huge, (true, true, false));
+    }
+
+    #[test]
+    fn classify_discriminated_types() {
+        let mut types = ComponentTypes::default();
+
+        // Discriminated types are inline so long as all their payloads are, but
+        // the discriminant itself always needs checking.
+        let option = types.option(InterfaceType::U32);
+        assert_classification(&types, option, (true, false, false));
+
+        let variant = types.variant(&[("a", InterfaceType::U32), ("b", InterfaceType::Float64)]);
+        assert_classification(&types, variant, (true, false, false));
+
+        let with_string = types.variant(&[("a", InterfaceType::U32), ("b", InterfaceType::String)]);
+        assert_classification(&types, with_string, (false, false, false));
+
+        let result = InterfaceType::Result(types.results.push(TypeResult {
+            ok: Some(InterfaceType::U32),
+            err: None,
+            abi: CanonicalAbiInfo::default(),
+            info: VariantInfo {
+                size: DiscriminantSize::Size1,
+                payload_offset32: 4,
+                payload_offset64: 8,
+            },
+        }));
+        assert_classification(&types, result, (true, false, false));
     }
 }
